@@ -1,12 +1,6 @@
 [submodule "targets/harfbuzz"]
 	path = targets/harfbuzz
 	url = https://github.com/harfbuzz/harfbuzz
-[submodule "targets/htslibgit"]
-	path = targets/htslibgit
-	url = https://github.com/samtools/htslib
-[submodule "targets/targets/htslib"]
-	path = targets/targets/htslib
-	url = https://github.com/samtools/htslib
 [submodule "targets/htslib"]
 	path = targets/htslib
 	url = https://github.com/samtools/htslib
