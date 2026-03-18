@@ -20,14 +20,14 @@ Output without --output (stdout, JSON):
       "confirmed": [
         {
           "key":           "<func>|<line>:<col>",
-          "func":          "<function name>",
+          "func":          "<function name (raw/mangled)>",
+          "demangled_func":"<demangled name, present only when func is a C++ mangled symbol>",
           "line":          "<line>",
           "col":           "<col>",
           "blocked_side":  "T_blocked" | "F_blocked",
           "primary_fuzzer":"<filename>",
           "confirm_fuzzer":"<filename>",
-          "cluster_id":    N,
-          "cluster_type":  "logical" | "switch" | "chain" | "single",
+          "source_line":   "<raw source text at the branch line>",
           "hits": { "<filename>": {"T": N, "F": N}, ... }
         }, ...
       ],
@@ -35,25 +35,12 @@ Output without --output (stdout, JSON):
     }
 
 Output with --output (Markdown report):
-    Ranked by flip strength (descending). Summary table includes a Cluster column.
-    Detail listings include cross-references to other members of the same cluster.
-
-Clustering (semantic, based on source line text):
-    logical  — source line contains && or ||  (sub-conditions of one expression)
-    switch   — source line matches case/default; anchor = enclosing switch stmt
-               (found via backward brace-depth scan)
-    chain    — source line matches else if; anchor = opening if of the chain
-               (found via backward brace-depth scan)
-    ternary  — source line contains ? but no if/case/else keywords
-               (conditional expression, not a control-flow branch)
-    single   — no recognizable pattern
+    Ranked by flip strength (descending).
 
 Each branch record includes a 'source_line' field with the raw source text at
 that line, shown in the Markdown detail listings for quick context.
-
-Brace-depth tracking handles one level of nesting correctly for switch and chain.
-Deeper nesting may occasionally produce mis-grouped clusters; the
-fuzzing-root-cause-analyzer agent confirms and refines all clusters in Step 1.5.
+Clustering is performed by the fuzzing-root-cause-analyzer agent using program
+slice analysis during root cause tracing.
 """
 
 import re
@@ -61,10 +48,8 @@ import sys
 import json
 import argparse
 import datetime
+import subprocess
 from collections import defaultdict
-
-
-_LOOKBACK_LIMIT = 100  # max source lines to scan backward for enclosing construct
 
 
 def parse_count(s):
@@ -104,8 +89,7 @@ def parse_cov_file(path):
 
     Each branch stores a reference to its section's line buffer (_section_lines).
     This dict is shared (not copied) across all branches in the same section and is
-    fully populated by end-of-section, so backward scans for enclosing constructs
-    always see the correct source text.
+    fully populated by end-of-section, so source line lookups always see correct text.
     """
     branches = {}
     current_func = None
@@ -138,8 +122,12 @@ def parse_cov_file(path):
                         current_source_file = new_file
                         current_section_lines = {}   # new dict = new section
                 else:
-                    # plain 'funcname' — stay in current source file section
+                    # plain 'funcname' (e.g. mangled C++ symbol with no file prefix).
+                    # Start a fresh section so this function's source lines don't
+                    # bleed into unrelated functions that share the same line numbers
+                    # (common in C++ template instantiations from different headers).
                     current_func = header
+                    current_section_lines = {}
 
             # Source line: add to current section buffer (last write wins within section)
             sm = source_re.match(line)
@@ -244,162 +232,51 @@ def flip_strength(b):
     return b['hits'].get(b.get('confirm_fuzzer', ''), {}).get(blocked_side, 0)
 
 
-# ---------------------------------------------------------------------------
-# Semantic clustering helpers
-# ---------------------------------------------------------------------------
-
-def find_enclosing_switch(section_lines, start_line):
+def batch_demangle(names):
     """
-    Scan backward from start_line to find the nearest enclosing switch statement.
+    Demangle a list of C++ symbol names via c++filt.
 
-    section_lines: the source-file-section line buffer from the branch's _section_lines.
-    Uses brace-depth tracking: going backward, each '}' increases depth and each
-    '{' decreases it. When depth drops below 0, we have found the '{' that opens
-    the block containing start_line. If that line (or the line just before a
-    standalone '{') contains 'switch (', return its line number.
-
-    Returns the line number of the switch statement, or None if not found.
-    Handles nested switches correctly via brace counting.
+    Returns a dict mapping original name -> demangled name.
+    Names that are unchanged (i.e. not mangled) map to themselves.
+    Falls back gracefully if c++filt is unavailable.
     """
-    depth = 0
-    for ln in range(start_line - 1, max(start_line - _LOOKBACK_LIMIT, 0), -1):
-        text = section_lines.get(ln, '')
-        depth += text.count('}') - text.count('{')
-        if depth < 0:
-            if re.search(r'\bswitch\s*\(', text):
-                return ln
-            # Handle split across two lines: switch (...)\n{
-            for prev in range(ln - 1, max(ln - 3, 0), -1):
-                pt = section_lines.get(prev, '')
-                if re.search(r'\bswitch\s*\(', pt):
-                    return prev
-                if pt.strip():
-                    break
-            return None
-    return None
+    if not names:
+        return {}
+    try:
+        result = subprocess.run(
+            ['c++filt'],
+            input='\n'.join(names),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        demangled = result.stdout.splitlines()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {n: n for n in names}
+    return {orig: dem for orig, dem in zip(names, demangled)}
 
 
-def find_chain_anchor(section_lines, start_line):
+def finalize_ranked(ranked):
     """
-    Scan backward from an 'else if' branch to find the opening 'if' of the chain.
+    Strip internal _section_lines from each branch record and attach source_line.
+    Also adds demangled_func when the C++ symbol differs from the raw func name.
 
-    section_lines: the source-file-section line buffer from the branch's _section_lines.
-    Returns the line number of the opening 'if' (the one with no preceding 'else'),
-    or None if not found or if we leave the enclosing block.
+    source_line carries the raw source text at the branch's line number, extracted
+    from the coverage file. Used by the root cause analyzer as quick context.
     """
-    depth = 0
-    for ln in range(start_line - 1, max(start_line - _LOOKBACK_LIMIT, 0), -1):
-        text = section_lines.get(ln, '')
-        depth += text.count('}') - text.count('{')
-        if depth < 0:
-            return None
-        stripped = text.strip()
-        if re.search(r'\bif\s*\(', stripped) and not re.search(r'\belse\b', stripped):
-            return ln
-    return None
+    # Batch-demangle all func names in one c++filt call
+    funcs = [b['func'] for b in ranked]
+    demangle_map = batch_demangle(funcs)
 
-
-def cluster_branches_semantic(ranked):
-    """
-    Group confirmed blockers into clusters using source line text.
-
-    Classification (checked in priority order):
-      logical  — source line contains && or ||
-                 (sub-conditions of one &&/|| expression at same line)
-      switch   — source line starts with 'case' or 'default:'
-                 anchor = enclosing switch statement line (via brace-depth scan)
-      chain    — source line contains 'else if ('
-                 anchor = opening 'if' of the chain (via brace-depth scan)
-      ternary  — source line contains '?' but no if/case/else keywords
-                 (conditional expression, e.g. x ? a : b)
-      single   — no recognizable pattern; always its own cluster
-
-    All branches sharing the same (type, func, anchor_line) key are grouped.
-    Lone 'logical' clusters (only 1 branch despite && in source) are downgraded
-    to 'single' to avoid false positives from && in string literals.
-
-    Each branch gets a 'source_line' field with the raw source text at its line.
-    The '_section_lines' key is stripped from each branch before output.
-
-    Returns an annotated copy of ranked with 'cluster_id', 'cluster_type',
-    and 'source_line' added.
-    """
-    # Pass 1: classify each branch, compute its cluster key, capture source line
-    keys = []
-    for b in ranked:
-        line = int(b['line'])
-        func = b['func']
-        section_lines = b.get('_section_lines', {})
-        src = section_lines.get(line, '')
-        stripped = src.strip()
-
-        # Logical: && or || present in the source line
-        if re.search(r'&&|\|\|', src):
-            keys.append(('logical', func, line))
-            continue
-
-        # Switch: line starts with 'case' or 'default:'
-        if re.match(r'(case\b|default\s*:)', stripped):
-            anchor = find_enclosing_switch(section_lines, line)
-            if anchor is not None:
-                keys.append(('switch', func, anchor))
-                continue
-
-        # Chain: line contains 'else if ('
-        if re.search(r'\belse\s+if\s*\(', src):
-            anchor = find_chain_anchor(section_lines, line)
-            if anchor is not None:
-                keys.append(('chain', func, anchor))
-                continue
-
-        # Ternary: line contains '?' but no control-flow keywords
-        if '?' in src and not re.search(r'\b(if|else|case|switch)\b', src):
-            keys.append(('ternary', func, line))
-            continue
-
-        # Single: no match
-        keys.append(('single', func, line))
-
-    # Pass 2: assign cluster IDs; singles always get a unique ID
-    key_to_id = {}
-    cluster_count = 0
-    cluster_ids = []
-    for key in keys:
-        if key[0] == 'single':
-            cluster_count += 1
-            cluster_ids.append(cluster_count)
-        else:
-            if key not in key_to_id:
-                cluster_count += 1
-                key_to_id[key] = cluster_count
-            cluster_ids.append(key_to_id[key])
-
-    # Pass 3: compute members per cluster; downgrade lone 'logical' to 'single'
-    # (guards against && in string literals or single-condition if statements)
-    members_by_cluster = defaultdict(list)
-    for i, cid in enumerate(cluster_ids):
-        members_by_cluster[cid].append(i)
-
-    cluster_type_map = {cluster_ids[i]: keys[i][0] for i in range(len(keys))}
-
-    for cid, members in members_by_cluster.items():
-        if cluster_type_map[cid] == 'logical' and len(members) == 1:
-            cluster_count += 1
-            new_cid = cluster_count
-            cluster_ids[members[0]] = new_cid
-            cluster_type_map[new_cid] = 'single'
-            del cluster_type_map[cid]
-
-    # Annotate ranked list (preserve original rank order); strip _section_lines
     result = []
-    for i, b in enumerate(ranked):
+    for b in ranked:
         b = dict(b)
         section_lines = b.pop('_section_lines', {})
-        b['cluster_id'] = cluster_ids[i]
-        b['cluster_type'] = cluster_type_map[cluster_ids[i]]
         b['source_line'] = section_lines.get(int(b['line']), '').strip()
+        demangled = demangle_map.get(b['func'], b['func'])
+        if demangled != b['func']:
+            b['demangled_func'] = demangled
         result.append(b)
-
     return result
 
 
@@ -412,16 +289,6 @@ def render_markdown(target, stats, ranked, cov_files):
     today = datetime.date.today().isoformat()
     fuzzer_labels = [p.split('/')[-1].replace('.cov', '') for p in cov_files]
     source_str = ', '.join(f'`coverage/{target}/{l}.cov`' for l in fuzzer_labels)
-
-    # Pre-compute cluster display info
-    members_by_cluster = defaultdict(list)   # cluster_id -> [(rank_1based, branch), ...]
-    for i, b in enumerate(ranked, 1):
-        members_by_cluster[b['cluster_id']].append((i, b))
-
-    total_clusters = max((b['cluster_id'] for b in ranked), default=0)
-    cid_width = max(2, len(str(total_clusters)))
-    def clabel(cid):
-        return f"C{cid:0{cid_width}d}"
 
     lines = []
     lines.append(f"# Input-Dependent Blocking Branches — {target} (All, Ranked by Flip Strength)\n")
@@ -437,18 +304,16 @@ def render_markdown(target, stats, ranked, cov_files):
     for label in fuzzer_labels:
         lines.append(f"| Asymmetric in {label} | {stats['asymmetric_per_fuzzer'].get(label, 0):,} |")
     lines.append(f"| **Confirmed input-dependent** | **{len(ranked):,}** |")
-    lines.append(f"| Unconfirmed candidates | {stats['unconfirmed_candidates']:,} |")
-    multi = sum(1 for idxs in members_by_cluster.values() if len(idxs) > 1)
-    lines.append(f"| Clusters (multi-branch) | {multi:,} |\n")
+    lines.append(f"| Unconfirmed candidates | {stats['unconfirmed_candidates']:,} |\n")
 
     lines.append("## Ranked Summary Table\n")
-    lines.append("| Rank | Cluster | Function | Line:Col | Blocked | Flip Strength | " +
+    lines.append("| Rank | Function | Line:Col | Blocked | Flip Strength | " +
                  " | ".join(f"{l} T:F" for l in fuzzer_labels) + " | Confirmed By |")
-    lines.append("|------|---------|----------|----------|---------|---------------|" +
+    lines.append("|------|----------|----------|---------|---------------|" +
                  "".join("------------|" for _ in fuzzer_labels) + "--------------|")
 
     for i, b in enumerate(ranked, 1):
-        func = b['func']
+        func = b.get('demangled_func', b['func'])
         if len(func) > 50:
             func = func[:47] + '...'
         loc = f"{b['line']}:{b['col']}"
@@ -458,11 +323,7 @@ def render_markdown(target, stats, ranked, cov_files):
         for label in fuzzer_labels:
             h = b['hits'].get(label, {})
             hits_cols.append(f"{h.get('T', '-')}:{h.get('F', '-')}")
-        cid = b['cluster_id']
-        ctype = b['cluster_type']
-        n_members = len(members_by_cluster[cid])
-        cluster_col = clabel(cid) if n_members == 1 else f"{clabel(cid)} ({ctype}×{n_members})"
-        lines.append(f"| {i} | {cluster_col} | `{func}` | {loc} | {blocked} | {fs:,} | " +
+        lines.append(f"| {i} | `{func}` | {loc} | {blocked} | {fs:,} | " +
                      " | ".join(hits_cols) + f" | {b.get('confirm_fuzzer', '-')} |")
 
     lines.append("")
@@ -473,12 +334,10 @@ def render_markdown(target, stats, ranked, cov_files):
         hit_label     = 'False' if b['blocked_side'] == 'T_blocked' else 'True'
         hit_key       = 'T' if hit_label == 'True' else 'F'
         fs = flip_strength(b)
-        cid = b['cluster_id']
-        ctype = b['cluster_type']
-        cluster_members = members_by_cluster[cid]
 
         src = b.get('source_line', '').strip()
-        lines.append(f"### {i}. `{b['func']}` @ {b['line']}:{b['col']}")
+        display_func = b.get('demangled_func', b['func'])
+        lines.append(f"### {i}. `{display_func}` @ {b['line']}:{b['col']}")
         if src:
             lines.append(f"- **Statement**: `{src}`")
         lines.append(f"- **Blocked side**: {blocked_label} (0 hits in `{b['primary_fuzzer']}`)")
@@ -489,14 +348,6 @@ def render_markdown(target, stats, ranked, cov_files):
         lines.append(f"- **Hit side**: {hit_label} ({hit_parts})")
         lines.append(f"- **Flip strength**: {fs:,} (blocked side hit {fs:,}× by `{b.get('confirm_fuzzer', '-')}`)")
         lines.append(f"- **Status**: ✅ CONFIRMED INPUT-DEPENDENT")
-
-        if len(cluster_members) == 1:
-            lines.append(f"- **Cluster**: {clabel(cid)} ({ctype})")
-        else:
-            other_ranks = [str(r) for r, _ in cluster_members if r != i]
-            lines.append(f"- **Cluster**: {clabel(cid)} ({ctype}, {len(cluster_members)} branches) "
-                         f"— also at rank{'s' if len(other_ranks) > 1 else ''} {', '.join(other_ranks)}")
-
         for label in fuzzer_labels:
             h = b['hits'].get(label, {})
             lines.append(f"- **{label} coverage**: T:{h.get('T', 0):,}  F:{h.get('F', 0):,}")
@@ -542,7 +393,7 @@ def main():
     }
 
     ranked = sorted(confirmed, key=flip_strength, reverse=True)
-    ranked = cluster_branches_semantic(ranked)
+    ranked = finalize_ranked(ranked)
 
     if args.output:
         report = render_markdown(args.target, stats, ranked, args.cov_files)

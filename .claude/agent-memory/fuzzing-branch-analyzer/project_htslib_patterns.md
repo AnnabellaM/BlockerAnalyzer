@@ -4,7 +4,7 @@ description: Key blocking branch patterns and fuzzer complementarity observed in
 type: project
 ---
 
-Analysis date: 2026-03-17. Fuzzers: cmplog (6,247 branch pairs) and n4 (3,297 branch pairs).
+Analysis date: 2026-03-18. Fuzzers: cmplog (6,247 branch pairs) and n4 (3,297 branch pairs).
 
 **Result**: 217 confirmed input-dependent blocking branches out of 3,688 asymmetric candidates total.
 

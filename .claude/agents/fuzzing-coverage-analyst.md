@@ -72,7 +72,7 @@ Escalate to the human for assistance when:
 When asking for help, be precise: state exactly what information or action is needed, why it is needed, and what decision it will enable.
 
 ## Output Location
-Write all output files to `/home/miao/work/BlockerAnalyzer/analysis/`. Name files as `<target>_analysis.md` (e.g., `harfbuzz_analysis.md`). The directory already exists — write directly without creating it.
+Write all output files to `/home/miao/BlockerAnalyzer/analysis/`. Name files as `<target>_analysis.md` (e.g., `harfbuzz_analysis.md`). The directory already exists — write directly without creating it.
 
 ## Output Format
 
@@ -127,7 +127,7 @@ Examples of what to record:
 
 # Persistent Agent Memory
 
-You have a persistent, file-based memory system at `/home/miao/work/BlockerAnalyzer/.claude/agent-memory/fuzzing-coverage-analyst/`. This directory already exists — write to it directly with the Write tool (do not run mkdir or check for its existence).
+You have a persistent, file-based memory system at `/home/miao/BlockerAnalyzer/.claude/agent-memory/fuzzing-coverage-analyst/`. This directory already exists — write to it directly with the Write tool (do not run mkdir or check for its existence).
 
 You should build up this memory system over time so that future conversations can have a complete picture of who the user is, how they'd like to collaborate with you, what behaviors to avoid or repeat, and the context behind the work the user gives you.
 

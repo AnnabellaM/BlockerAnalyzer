@@ -36,13 +36,13 @@ wc -l <cov_file>
 
 ### Using the extract_blockers.py Tool
 
-The tool at `/home/miao/work/BlockerAnalyzer/tools/extract_blockers.py` handles Steps 1–4 automatically for llvm-cov annotated source files. Run it via Bash:
+The tool at `/home/miao/BlockerAnalyzer/tools/extract_blockers.py` handles Steps 1–4 automatically for llvm-cov annotated source files. Run it via Bash:
 
 **Preferred: write the ranked Markdown report directly with `--output`:**
 ```bash
-python3 /home/miao/work/BlockerAnalyzer/tools/extract_blockers.py \
+python3 /home/miao/BlockerAnalyzer/tools/extract_blockers.py \
   --target <target_name> \
-  --output /home/miao/work/BlockerAnalyzer/blockers/<target>_blockers.md \
+  --output /home/miao/BlockerAnalyzer/blockers/<target>_blockers.md \
   [--limit <N>] \
   <cov_file1> [<cov_file2> ...]
 ```
@@ -57,7 +57,7 @@ Arguments:
 
 **Alternative: get raw JSON for custom processing:**
 ```bash
-python3 /home/miao/work/BlockerAnalyzer/tools/extract_blockers.py \
+python3 /home/miao/BlockerAnalyzer/tools/extract_blockers.py \
   --target htslib \
   coverage/htslib/cmplog.cov coverage/htslib/n4.cov \
   > /tmp/htslib_blockers.json 2>/dev/null
@@ -107,11 +107,10 @@ After confirmed branches, list unconfirmed candidates (no ranking defined — li
 - Flip strength value
 - Evidence from other fuzzers (which fuzzer hit the missing side, with what hitcount)
 - Confirmation status: CONFIRMED INPUT-DEPENDENT or UNCONFIRMED CANDIDATE
-- **Cluster ID and type**: `extract_blockers.py` automatically groups related branches — `logical` (`&&`/`||`), `switch` (case arms), `chain` (else-if arms), `ternary` (`?`), or `single`. The Cluster column in the summary table and the Cluster line in each detail entry show this.
-- **Statement context**: the raw source line at the branch location, shown as `**Statement**` in each detail entry. Use this to quickly understand what condition controls the branch without opening the source file.
+- **Statement context**: the raw source line at the branch location, shown as `**Statement**` in each detail entry. Use this to quickly understand what condition controls the branch without opening the source file. Clustering is performed later by `fuzzing-root-cause-analyzer` using program slice similarity.
 
 ## Output Location
-Write all output files to `/home/miao/work/BlockerAnalyzer/blockers/`. Name files as `<target>_blockers.md` (e.g., `harfbuzz_blockers.md`). The directory already exists — write directly without creating it.
+Write all output files to `/home/miao/BlockerAnalyzer/blockers/`. Name files as `<target>_blockers.md` (e.g., `harfbuzz_blockers.md`). The directory already exists — write directly without creating it.
 
 ## Output Format
 Structure your output as follows:
@@ -165,7 +164,7 @@ Examples of what to record:
 
 # Persistent Agent Memory
 
-You have a persistent, file-based memory system at `/home/miao/work/BlockerAnalyzer/targets/.claude/agent-memory/fuzzing-branch-analyzer/`. This directory already exists — write to it directly with the Write tool (do not run mkdir or check for its existence).
+You have a persistent, file-based memory system at `/home/miao/BlockerAnalyzer/.claude/agent-memory/fuzzing-branch-analyzer/`. This directory already exists — write to it directly with the Write tool (do not run mkdir or check for its existence).
 
 You should build up this memory system over time so that future conversations can have a complete picture of who the user is, how they'd like to collaborate with you, what behaviors to avoid or repeat, and the context behind the work the user gives you.
 

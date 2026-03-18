@@ -1,353 +1,599 @@
-# Root Cause Report — htslib Fuzzing Blockers
+# Root Cause Analysis — htslib (Top 20 Blocking Branches)
 
-**Target:** htslib (`test/fuzz/hts_open_fuzzer.c`)
-**Fuzzers analyzed:** AFL++ cmplog, AFL++ n4
-**Coverage format:** llvm-cov annotated source (per `coverage/htslib/`)
-**Date:** 2026-03-17
+**Analysis date:** 2026-03-18
 **Analyst:** fuzzing-root-cause-analyzer
+**Source:** `/home/miao/BlockerAnalyzer/targets/htslib/`
+**Blockers source:** `/home/miao/BlockerAnalyzer/blockers/htslib_blockers.md` (ranks 1–20)
+**Fuzzers:** AFL++ cmplog (primary), AFL++ n4 (confirming)
+**Entry point:** `LLVMFuzzerTestOneInput` in `test/fuzz/hts_open_fuzzer.c`
 
 ---
 
-## Fuzzer Entry Point
+## Cluster Decisions (Step 1.5)
 
-`LLVMFuzzerTestOneInput` in `test/fuzz/hts_open_fuzzer.c`:
+The pre-computed clusters from `extract_blockers.py` were reviewed against source code.
+Adjustments made:
 
-1. Wraps the input bytes in an in-memory `hFILE` via `hopen("mem:", ...)`.
-2. Opens it with `hts_hopen`, which runs format detection (`hts_detect_format2`).
-3. Dispatches based on `format.category`:
-   - `sequence_data` → `view_sam()` three times (SAM output, BAM output, CRAM output).
-   - `variant_data` → `view_vcf()` twice.
-   - Anything else → no-op return.
-
-For `sequence_data`, format detection requires the input to begin with the CRAM magic bytes `CRAM` (0x43 0x52 0x41 0x4D), a `@` SAM header line, or a BAM BGZF magic. For SAM, `view_sam` then calls `sam_hdr_read` → `sam_hrecs_parse_line` to parse `@`-prefixed header lines.
+| Decision | Ranks | Rationale |
+|----------|-------|-----------|
+| Merge ranks 3 + 4 → C01 (switch) | 3, 4 | Both are `case` arms in the same `switch (severity)` in `get_severity_tag` (hts.c:5167). Confirmed single switch. |
+| Merge ranks 7 + 8 + 9 → C02 (switch) | 7, 8, 9 | All three are `case sam:` arms in three different format-dispatch switches. Same root cause: SAM format never produced by n4. Analyzed as one thematic cluster with per-function sub-notes. |
+| Merge ranks 1 + 11 + 12 + 13 + 20 → C03 (chain) | 1, 11, 12, 13, 20 | All are NULL-guard `if (c->field)` checks inside `cram_free_container`. Shared cause: encoder-only fields are never populated by decoder path; n4 never reaches CRAM at all. |
+| Merge ranks 10 + 14 + 16 → C04 (chain) | 10, 14, 16 | Three adjacent guards in `sam_hdr_destroy` on ref_count, target_name, and hrecs. All blocked for the same reason: n4 never produces SAM/BAM headers that populate these fields. |
+| Merge ranks 6 + 17 → C05 (logical) | 6, 17 | Both are sequential guards in `sam_hdr_fill_hrecs` on bh->text/l_text and bh->target_name/n_targets. Blocked identically: n4 BAM inputs lack both text and target arrays. |
+| Keep rank 2 → C06 (single) | 2 | `ks_resize` False path (buffer reuse). Standalone. |
+| Keep rank 5 → C07 (single) | 5 | `pool_destroy` loop True. Standalone. |
+| Keep rank 15 → C08 (single) | 15 | `add_stub_ref_sq_lines` loop True. Standalone. |
+| Keep rank 18 → C09 (single) | 18 | `sam_hdr_count_lines` error-return guard. Standalone. |
+| Keep rank 19 → C10 (single) | 19 | `hts_detect_format2` `@CO\t` magic. Standalone. |
 
 ---
 
-## Blocker Analyses
+## Skipped Blockers
+
+No blockers in ranks 1–20 were eliminated by NEG rules. All 20 are reachable in principle
+and blocked by analysable input-dependent constraints.
 
 ---
 
-### BLOCKER 1
+## Findings (ordered Critical → High)
 
+---
+
+### BLOCKING BRANCH ANALYSIS
 ```
-BLOCKING BRANCH ANALYSIS
 ========================
-Location: cram/cram_io.c:3747 (cram_free_container)
-Branch Condition: if (c->stats[id])   [for id = DS_RN..DS_TN in a for-loop]
-Blocked Side: False (condition is always True in cmplog; always False in n4)
-Coverage Status: n4: True=101,000 / False=0  |  cmplog: True=118,000 / False=138,000
-Flip Strength: 138,000
+Cluster: C03 (chain — NULL-guard checks in cram_free_container)
+Branches:
+  cram/cram_io.c:3720:9  False  (rank 20 — if (c->landmark))
+  cram/cram_io.c:3723:9  False  (rank 13 — if (c->comp_hdr))
+  cram/cram_io.c:3730:9  False  (rank 11 — if (c->slices))
+  cram/cram_io.c:3747:13 False  (rank  1 — if (c->stats[id]))
+  cram/cram_io.c:3751:9  False  (rank 12 — if (c->tags_used))
+Location: cram_free_container() in cram/cram_io.c (lines 3710–3785)
+Branch Condition: NULL-pointer guards — False arm means the field is NULL
+  and the corresponding free/cleanup is skipped.
+Coverage Status (blocked side is always False = "field is NULL"):
+  Rank  1 (3747:13): cmplog T:118,000 F:138,000 | n4 T:101,000 F:0
+  Rank 11 (3730:9 ): cmplog T:4,230   F:4,930   | n4 T:3,600   F:0
+  Rank 12 (3751:9 ): cmplog T:4,230   F:4,930   | n4 T:3,600   F:0
+  Rank 13 (3723:9 ): cmplog T:4,310   F:4,850   | n4 T:3,600   F:0
+  Rank 20 (3720:9 ): cmplog T:6,510   F:2,650   | n4 T:3,600   F:0
+  All five: True arm (field set, free it) reached by both fuzzers.
+            False arm (field NULL, skip) reached only by cmplog, never by n4.
 ```
 
 **Execution Path to Branch:**
-
 ```
 LLVMFuzzerTestOneInput
-  → view_sam(..., "wc", 0)          [CRAM output mode]
-    → hts_hopen(memfile, "data", "rb")   [format detection]
-    → sam_hdr_read(in)
-    → sam_read1 loop → sam_write1
-      → cram_encode.c: cram_put_bam_seq
-        → cram_new_container(seqs_per_slice, slices_per_container)
-            [allocates c->stats[DS_RN..DS_TN] via cram_stats_create()]
-        → cram_encode_container(fd, c)
-        → cram_free_container(c)
-            → for (id = DS_RN; id < DS_TN; id++)
-                if (c->stats[id])         ← BRANCH AT LINE 3747
-```
-
-Also reached in the CRAM *decoder* path:
-
-```
-LLVMFuzzerTestOneInput
-  → view_sam(..., "rb")
-    → cram_decode.c: cram_get_seq
-      → cram_read_container(fd)     [calloc-based: stats[] all NULL]
-      → cram_free_container(c)
-          → for (id = DS_RN; id < DS_TN; id++)
-              if (c->stats[id])     ← always False when from cram_read_container
+  → detects format == cram  (requires bytes 0–5 == "CRAM" + version)
+  → view_sam(data, size, "wc", 0)     [CRAM write path]
+      → hts_hopen(memfile, "data", "rb")
+          → cram_dopen(hfile, "data", "r")
+              → cram_read_file_def()   [consumes CRAM magic + header]
+              → cram_read_SAM_hdr()
+      → sam_hdr_read(in)
+      → sam_write1(out, hdr, b)  loop
+          → cram_encode_container(fd, ...)
+              → cram_new_container()    [populates c->landmark, c->comp_hdr,
+                                         c->slices, c->stats[], c->tags_used]
+      → hts_close(out)
+          → cram_close(fd)
+              → cram_flush_container_mt(fd)
+              → cram_free_container(c)   ← BLOCKING BRANCHES
+                  False arm: field was never set → NULL
 ```
 
 **Path Conditions Required:**
+1. Input bytes 0–3 must equal `CRAM` (0x43 0x52 0x41 0x4D) — 4-byte magic prefix.
+2. Byte 4 must be in [1,7] and byte 5 in [0,7] — CRAM version range check (hts.c:633).
+3. Bytes 6–29: 4-byte big-endian SAM header length + header text (may be empty) — CRAM file definition.
+4. The fuzzer must then produce a CRAM input that is minimal enough that some container
+   fields are not populated (decoder path) while others are (produces the False arm).
+5. Alternatively: the CRAM encoder path (view_sam with "wc" mode) creates a fully
+   populated container; the decoder path may produce NULL fields.
 
-1. Input must begin with CRAM magic bytes `CRAM` (0x43 0x52 0x41 0x4D) for `format.category` to be `sequence_data` and CRAM format to be selected.
-2. The CRAM file must contain a structurally valid SAM container header so that `cram_read_container` succeeds far enough to return a non-NULL container.
-3. For the **True branch** (n4 is blocked on False): a container must have been created via `cram_new_container` (the encoder path), which explicitly calls `cram_stats_create()` for all `DS_RN..DS_TN` slots (cram_io.c:3681-3682). This happens only in the CRAM *write* path (`view_sam(..., "wc", 0)`).
-4. For the **False branch** (n4 never hits it): a CRAM container must be read via `cram_read_container` (cram_io.c:3883), which uses `calloc` — leaving `stats[]` all-NULL. The False side fires when freeing a decoded container that was never populated by the encoder.
-
-**Root Cause Category:** Input Format/Structure Constraint + Path Explosion / Depth Barrier
+**Root Cause Category:** Input Format / Structure Constraints (CRAM magic bytes);
+                         Fuzzer Seed/Dictionary Deficiency
 
 **Root Cause Explanation:**
+The five False arms fire when `cram_free_container` is called on a container where the
+corresponding field was never initialized. This happens in two scenarios:
+(a) CRAM decoder path: `cram_read_container` uses `calloc`, leaving fields NULL until
+    they are explicitly populated from the bitstream. If the container body is absent or
+    truncated, fields like `c->comp_hdr`, `c->slices`, `c->tags_used`, and `c->landmark`
+    remain NULL.
+(b) The stats[] array (rank 1, line 3747) is populated only by `cram_new_container`
+    (encoder path, cram_io.c:3682) via `cram_stats_create()`. The decoder path never
+    creates stats objects; the loop `for (id = DS_RN; id < DS_TN; id++)` always finds
+    c->stats[id] == NULL.
 
-`cram_free_container` is called from two distinct origins:
+The n4 fuzzer never produces any of these scenarios because it never produces an input
+whose first 6 bytes satisfy the CRAM magic check:
+```c
+// hts.c:633
+if (len >= 6 && memcmp(s,"CRAM",4) == 0 && s[4]>=1 && s[4]<=7 && s[5]<=7)
+```
+This five-part conjunction requires the specific ASCII string "CRAM" followed by two
+constrained byte values. Without a CRAM seed, the probability of a random mutation
+satisfying all six byte positions simultaneously is approximately 1 in 2^46 per trial.
+Because n4 never classifies any input as `cram` format, it never calls `cram_dopen`,
+never creates or reads a CRAM container, and `cram_free_container` is never called at all
+by n4. All five False branches are permanently unreachable by n4.
 
-- **Encoder path** (`cram_new_container` → `cram_encode_container` → `cram_free_container`): The `stats[]` array is fully populated because `cram_new_container` explicitly allocates each slot. The True branch always fires here. This is what cmplog exercises when it successfully produces CRAM output.
+The cmplog fuzzer has CRAM inputs in its corpus (flip strength 138,000 on rank 1) and
+exercises both the encoder path (True arm: field set → free it) and decoder path with
+partial data (False arm: field NULL → skip).
 
-- **Decoder path** (`cram_read_container` → `cram_free_container`): The container is `calloc`-initialized at cram_io.c:3883; `stats[]` is never populated during decoding. The False branch always fires here.
-
-The n4 fuzzer never reaches the encoder path because it cannot construct a CRAM input that passes all of CRAM format detection, magic byte validation (bytes 0–3 must be `C`, `R`, `A`, `M`), and SAM header parsing. Without a valid CRAM input, `format.category != sequence_data`, the `view_sam(..., "wc", ...)` call is skipped entirely, and `cram_new_container` is never invoked. Consequently `cram_free_container` only ever sees decoder-path containers (stats all NULL), so the False branch for `if (c->stats[id])` has zero hits in n4.
-
-The n4 fuzzer also reaches `cram_free_container` from early-exit error paths in `cram_read_container` itself (e.g., line 3890, 3896, 3901), all of which produce containers with `stats[]` null — reinforcing the all-True count.
-
-**Fuzzer Barrier Severity: Critical**
-
-The CRAM magic bytes `CRAM` are a 4-byte exact match at offset 0. Without them, format detection returns a non-CRAM category and the entire CRAM encoder path is bypassed. The n4 fuzzer (which lacks cmplog's comparison-logging feedback) cannot guess this 4-byte sequence under random mutation from typical seed inputs.
+**Fuzzer Barrier Severity:** Critical
+(Mathematically infeasible without targeted help — requires 4 exact magic bytes plus
+two constrained version bytes; pure mutation from non-CRAM seeds cannot reach this)
 
 **Recommended Mitigations:**
-
-1. Add a minimal valid CRAM seed file (even a single-record CRAM) to the fuzzer corpus. This immediately routes the input through `sequence_data` and activates both the decoder and encoder paths.
-2. Add the token `CRAM` (bytes `0x43 0x52 0x41 0x4D`) to the AFL++ fuzzer dictionary so that mutation can produce inputs with the correct magic prefix.
-3. Consider a structure-aware CRAM mutator or a CRAM-specific harness that bypasses format detection and calls `cram_new_container` / `cram_encode_container` directly.
+1. Add a minimal valid CRAM file to the n4 seed corpus. Even a 1-record CRAM file
+   (e.g., created with `samtools view -C input.bam > minimal.cram`) unblocks all
+   five branches simultaneously.
+2. Add `CRAM` (4 bytes) as a dictionary token (AFL++ `-x` option).
+3. Add version byte patterns: `\x01\x00`, `\x02\x01`, `\x03\x00` as 2-byte dictionary
+   tokens to help n4 construct the magic+version prefix by splicing.
+4. A structured mutator with CRAM format awareness would complement seed-based coverage.
 
 ---
 
-### BLOCKER 2
-
+### BLOCKING BRANCH ANALYSIS
 ```
-BLOCKING BRANCH ANALYSIS
 ========================
-Location: htslib/kstring.h:162 (ks_resize inline, instantiated in header.c)
-Branch Condition: if (s->m < size)   — False side: buffer already large enough
-Blocked Side: False (n4 never hits the branch-not-taken path)
-Coverage Status: n4: True=5,490 / False=0  |  cmplog: True=15,900 / False=27,800
-Flip Strength: 27,800
+Cluster: C02 (switch — `case sam:` arm blocked in three dispatch functions)
+Branches:
+  hts.c:1583:5  True  (rank 7 — case sam: in hts_hopen format switch)
+  sam.c:4394:9  True  (rank 8 — case sam: in sam_read1 format switch)
+  sam.c:2207:5  True  (rank 9 — case sam: in sam_hdr_read format switch)
+Location: hts_hopen() (hts.c:1571), sam_read1() (sam.c:4267),
+          sam_hdr_read() (sam.c:1928)
+Branch Condition: switch (fp->format.format) { case sam: ... }
+Coverage Status (blocked side is always True = SAM format selected):
+  Rank 7 (hts.c:1583:5 T): cmplog T:6,840  F:20,500 | n4 T:0  F:13,000
+  Rank 8 (sam.c:4394:9 T): cmplog T:5,940  F:20,200 | n4 T:0  F:200,000
+  Rank 9 (sam.c:2207:5 T): cmplog T:5,130  F:5,760  | n4 T:0  F:5,490
+  All three: False arm (non-SAM format dispatch) heavily hit by n4;
+             True arm (SAM format) completely absent in n4.
 ```
 
-The `ks_resize` inline function (kstring.h:159-172):
+**Execution Path to Branch (representative — hts_hopen, rank 7):**
+```
+LLVMFuzzerTestOneInput
+  → hts_hopen(memfile, "data", "rb")
+      → hts_detect_format2(hfile, fn, &fp->format)   [hts.c:1489]
+          → reads first bytes of input (up to ~512 bytes)
+          → checks SAM header tokens (hts.c:693–696):
+              s[0] == '@' AND one of:
+                memcmp(s, "@HD\t", 4) == 0
+                memcmp(s, "@SQ\t", 4) == 0
+                memcmp(s, "@RG\t", 4) == 0
+                memcmp(s, "@PG\t", 4) == 0
+                memcmp(s, "@CO\t", 4) == 0
+          → sets fp->format.format = sam
+      → switch (fp->format.format) {
+          case sam:   ← BLOCKED IN n4
+            fp->fp.hfile = hfile;
+          }
+```
 
+**Path Conditions Required:**
+1. Input must begin with exactly one of: `@HD\t`, `@SQ\t`, `@RG\t`, `@PG\t`, or `@CO\t`
+   (4-byte SAM header prefix with literal tab character as the 4th byte).
+2. OR: input must parse as a tab-delimited SAM record with ≥11 columns (body-only SAM).
+3. Once SAM format is detected, all three dispatch switches downstream see
+   `fp->format.format == sam` and take the `case sam:` arm.
+
+**Root Cause Category:** Input Format / Structure Constraints; Fuzzer Seed/Dictionary Deficiency
+
+**Root Cause Explanation:**
+SAM format detection (hts.c:693) requires a 4-byte magic prefix of the form `@XX\t`
+where `XX` is one of five specific two-letter tag codes. The n4 fuzzer has never produced
+any input satisfying this pattern, so `fp->format.format` is never `sam`. All three
+`case sam:` dispatch arms across `hts_hopen`, `sam_hdr_read`, and `sam_read1` are
+unreachable by n4.
+
+The asymmetry in False-arm counts (n4 hits 13,000–200,000 False occurrences) shows n4
+reaches all three functions regularly with non-SAM inputs (BAM, unrecognized). The zero
+True-arm count is not a depth problem — n4 reaches the switch — but a format-detection
+gate problem upstream.
+
+The cmplog fuzzer's compare-logging instrumentation records the byte comparisons in
+`memcmp(s, "@HD\t", 4)` etc. and feeds them as mutation hints, allowing it to construct
+SAM header prefixes and exercise the `case sam:` arm (flip strength 5,000–7,000).
+
+**Fuzzer Barrier Severity:** High
+(4-byte magic value with literal `@`, two specific alpha chars, and `\t`;
+without a dictionary token, n4 has a ~1-in-2^32 chance per mutation trial)
+
+**Recommended Mitigations:**
+1. Add a minimal SAM seed to the n4 corpus:
+   ```
+   @HD\tVN:1.6\tSO:unsorted\n
+   ```
+   This 24-byte seed satisfies format detection and exercises the `case sam:` arm in all
+   three functions simultaneously.
+2. Add SAM header tokens to the AFL++ dictionary:
+   `@HD\t`, `@SQ\t`, `@RG\t`, `@PG\t`, `@CO\t`, `VN:1.6\t`, `SN:`, `LN:`.
+3. A SAM seed with actual alignment records (11 tab-separated fields after the header)
+   additionally exercises `sam_read1`'s `case sam:` arm during the read loop.
+
+---
+
+### BLOCKING BRANCH ANALYSIS
+```
+========================
+Cluster: C01 (switch — HTS_LOG_ERROR vs HTS_LOG_WARNING case arms)
+Branches:
+  hts.c:5123:5 (source: ~5168:5) False  (rank 3 — past HTS_LOG_ERROR case)
+  hts.c:5125:5 (source: ~5170:5) True   (rank 4 — HTS_LOG_WARNING case match)
+Location: get_severity_tag() in hts.c (lines 5165–5183 in source)
+Branch Condition: switch (severity) with case HTS_LOG_ERROR / HTS_LOG_WARNING
+Coverage Status:
+  Rank 3 (5123:5 F): cmplog T:7,640   F:22,600 | n4 T:279   F:0
+  Rank 4 (5125:5 T): cmplog T:22,600  F:7,640  | n4 T:0     F:279
+  Interpretation: in n4, when get_severity_tag fires, severity is always
+  HTS_LOG_ERROR (value 1 in enum); the WARNING arm (value 3) is never reached.
+  In cmplog, WARNING fires 22,600 times vs ERROR 7,640 times.
+```
+
+**Code context (hts.c:5165–5183):**
 ```c
-static inline int ks_resize(kstring_t *s, size_t size)
+static char get_severity_tag(enum htsLogLevel severity)
 {
-    if (s->m < size) {           // line 162 — False side blocked in n4
+    switch (severity) {
+    case HTS_LOG_ERROR:        // value 1 — rank 3: False arm (fall-through past it)
+        return 'E';
+    case HTS_LOG_WARNING:      // value 3 — rank 4: True arm (match)
+        return 'W';
+    case HTS_LOG_INFO:         // value 4
+        return 'I';
+    case HTS_LOG_DEBUG:        // value 5
+        return 'D';
+    case HTS_LOG_TRACE:        // value 6
+        return 'T';
+    default:
+        break;
+    }
+    return '*';
+}
+```
+Note: value 2 is absent from the enum (gap between ERROR=1 and WARNING=3).
+
+**Execution Path to Branch:**
+```
+LLVMFuzzerTestOneInput
+  → view_sam(...)
+      → sam_hdr_read(in) / sam_hdr_parse / header processing
+          → triggers hts_log(HTS_LOG_WARNING, context, fmt, ...)
+              [only if a soft-validation anomaly is encountered]
+              → hts_verbose check: WARNING (3) <= default hts_verbose (3) → pass
+              → get_severity_tag(HTS_LOG_WARNING)  ← BLOCKED IN n4
+                  case HTS_LOG_WARNING: return 'W';
+```
+
+**Path Conditions Required:**
+1. `hts_log` must be called with `severity == HTS_LOG_WARNING` (enum value 3).
+2. The call fires only for specific soft-validation conditions in header parsing, such as:
+   - Duplicate `@SQ` line with conflicting `LN:` value (header.c:162 triggers a warning).
+   - `@SQ` line missing a required tag.
+   - Alignment record with a field value out of expected range but not fatal.
+3. The input must be partially valid: valid enough for format detection and initial parsing
+   to succeed (ERROR would fire only on hard parse failures), but containing one structural
+   anomaly that triggers a WARNING-level diagnostic.
+
+**Root Cause Category:** Deep Nested Condition Dependencies; Fuzzer Seed/Dictionary Deficiency
+
+**Root Cause Explanation:**
+`get_severity_tag` is called inside `hts_log` only when a log event fires at or below the
+current verbosity threshold. n4's inputs produce only ERROR-level log events (hard parse
+failures during SAM/header processing) or no log events at all. They never produce the
+"semi-valid with one anomaly" inputs needed to trigger WARNING-level events.
+
+The specific trigger most accessible to fuzzing is a duplicate `@SQ` entry with differing
+`LN:` values (header.c:162: `if (tmp != -1 && tmp != len)`). This fires:
+```c
+hts_log_error("Header includes @SQ line ...");  // inside sam_hdr_fill_hrecs -> no, WARNING
+```
+Actually the warning is at: a second `@SQ SN:xxx LN:yyy` where the LN differs from the
+first occurrence — `invLN = 1` is set and a warning is emitted at header.c after the
+tag loop. The cmplog fuzzer has learned to produce such inputs (flip strength 22,600).
+
+Additionally, the enum gap (no value 2) means a fuzzer numerically sweeping enum values
+would jump from ERROR=1 to WARNING=3, skipping value 2 entirely. Without knowing the
+exact enum value 3, a mutator relying on arithmetic mutations would miss WARNING.
+
+**Fuzzer Barrier Severity:** High
+(Requires a partially-valid SAM/BAM input with a specific structural anomaly;
+the enum gap compounds the difficulty for numeric mutation strategies)
+
+**Recommended Mitigations:**
+1. Add a SAM seed specifically crafted to trigger a WARNING: duplicate `@SQ` with
+   conflicting lengths:
+   ```
+   @HD\tVN:1.6\n@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr1\tLN:2000\n
+   ```
+   This unblocks ranks 3 and 4 simultaneously.
+2. Add `\x03` (the integer value of HTS_LOG_WARNING) as a dictionary byte if any code
+   path passes the severity as a raw integer.
+3. The C02 SAM seeds are a prerequisite (n4 must reach SAM parsing before WARNING can fire).
+
+---
+
+### BLOCKING BRANCH ANALYSIS
+```
+========================
+Cluster: C04 (chain — field-guard checks in sam_hdr_destroy)
+Branches:
+  sam.c:122:9  True   (rank 10 — if (bh->ref_count > 0))
+  sam.c:127:9  True   (rank 16 — if (bh->target_name))
+  sam.c:134:9  False  (rank 14 — if (bh->hrecs))
+Location: sam_hdr_destroy() in sam.c (lines 117–140)
+Branch Condition: guards on ref_count, target_name, and hrecs fields
+Coverage Status:
+  Rank 10 (122:9 T): cmplog T:5,050  F:15,300 | n4 T:0  F:7,330
+  Rank 16 (127:9 T): cmplog T:3,590  F:11,700 | n4 T:0  F:7,330
+  Rank 14 (134:9 F): cmplog T:11,100 F:4,220  | n4 T:7,330 F:0
+  Rank 10 + 16 True: n4 never reaches destroy with a populated header.
+  Rank 14 False: n4 always has hrecs set (SAM path); BAM path (hrecs=NULL)
+                 is blocked.
+```
+
+**Code at sam_hdr_destroy (sam.c:117–140):**
+```c
+void sam_hdr_destroy(sam_hdr_t *bh) {
+    int32_t i;
+    if (bh == NULL) return;
+
+    if (bh->ref_count > 0) {      // line 123 — rank 10 True BLOCKED in n4
+        --bh->ref_count;           // decrement and return without freeing
+        return;
+    }
+    if (bh->target_name) {         // line 128 — rank 16 True BLOCKED in n4
+        for (i = 0; i < bh->n_targets; ++i)
+            free(bh->target_name[i]);
+        free(bh->target_name);
+        free(bh->target_len);
+    }
+    free(bh->text);
+    if (bh->hrecs)                  // line 135 — rank 14 False BLOCKED in n4
+        sam_hrecs_free(bh->hrecs);
+    if (bh->sdict)
+        kh_destroy(s2i, (khash_t(s2i) *) bh->sdict);
+    free(bh);
+}
+```
+
+**Execution Paths:**
+
+*Rank 10 True (ref_count > 0):*
+```
+LLVMFuzzerTestOneInput
+  → view_sam(data, size, "w", 1)    [SAM format input]
+      → sam_hdr_read(in)
+          [SAM path: sam_hdr_create → sam_hdr_build_from_sam_file]
+          → fp->bam_header->ref_count = 1    [sam.c:1915]
+      → sam_hdr_destroy(hdr)        ← bh->ref_count == 1 → True arm
+```
+
+*Rank 16 True (target_name not NULL):*
+```
+  → sam_hdr_read(in) on a SAM/BAM input with @SQ lines
+      → bh->target_name allocated  [via target array construction]
+  → sam_hdr_destroy(hdr)           ← target_name set → True arm
+```
+
+*Rank 14 False (hrecs is NULL):*
+```
+  → sam_hdr_read(in) on a BAM input
+      → bam_hdr_read() → produces header with hrecs == NULL
+  → sam_hdr_destroy(hdr)           ← bh->hrecs == NULL → False arm (skip free)
+```
+
+**Path Conditions Required:**
+- Rank 10: SAM format input (so ref_count is set to 1 by `sam_hdr_read`).
+- Rank 16: SAM input with `@SQ` lines OR BAM input with reference entries.
+- Rank 14: BAM input (so `bam_hdr_read` creates header without hrecs).
+
+**Root Cause Category:** Input Format / Structure Constraints (SAM/BAM format gates)
+
+**Root Cause Explanation:**
+All three branches require format-specific behavior:
+- Ranks 10 and 16 require SAM format: n4 never produces SAM inputs (blocked by C02's
+  `@XX\t` gate), so `ref_count` and `target_name` are never set to their non-zero states.
+- Rank 14 requires BAM format: n4 never produces BAM inputs (magic `BAM\1` gate), so
+  `bam_hdr_read` is never called, and the only path to `sam_hdr_destroy` in n4 comes via
+  the SAM/CRAM path which always populates `bh->hrecs` before destroy.
+
+In practice, `sam_hdr_destroy` is called 7,330 times by n4 (False arm of rank 14), but
+always with `bh->hrecs != NULL` (n4's SAM parse populates hrecs immediately via
+`sam_hdr_create`) and always with `ref_count == 0` and `target_name == NULL`.
+
+**Fuzzer Barrier Severity:** High
+
+**Recommended Mitigations:**
+1. SAM seeds (C02 mitigation) unblock ranks 10 and 16 directly.
+2. A BAM seed with `BAM\1` magic unblocks rank 14 (hrecs=NULL from bam_hdr_read).
+3. Add `BAM\1` to the AFL++ dictionary for the BAM magic prefix.
+
+---
+
+### BLOCKING BRANCH ANALYSIS
+```
+========================
+Cluster: C05 (logical — sam_hdr_fill_hrecs input-field guards)
+Branches:
+  header.c:1134:9  True  (rank 17 —
+    if (bh->target_name && bh->target_len && bh->n_targets > 0))
+  header.c:1142:21 True  (rank  6 —
+    if (bh->text && bh->l_text > 0))
+Location: sam_hdr_fill_hrecs() in header.c (lines 1289–1321)
+Branch Condition: guards on the presence of pre-existing target arrays and raw text
+Coverage Status:
+  Rank  6 (1142:21 T): cmplog T:7,260  F:3,420  | n4 T:0  F:1,830
+  Rank 17 (1134:9  T): cmplog T:3,540  F:11,600 | n4 T:0  F:7,330
+  n4 reaches the function (False arm hit) but neither True branch fires.
+```
+
+**Code at sam_hdr_fill_hrecs (header.c:1289–1321):**
+```c
+int sam_hdr_fill_hrecs(sam_hdr_t *bh) {
+    sam_hrecs_t *hrecs = sam_hrecs_new();
+    if (!hrecs) return -1;
+
+    if (bh->target_name && bh->target_len && bh->n_targets > 0) { // line 1295 (rank 17)
+        if (sam_hrecs_refs_from_targets_array(hrecs, bh) != 0) {
+            sam_hrecs_free(hrecs);
+            return -1;
+        }
+    }
+
+    if (bh->text && bh->l_text > 0) {  // line 1303 (rank 6)
+        if (sam_hrecs_parse_lines(hrecs, bh->text, bh->l_text) != 0) {
+            sam_hrecs_free(hrecs);
+            return -1;
+        }
+    }
+
+    if (add_stub_ref_sq_lines(hrecs) < 0) { ...  }
+    bh->hrecs = hrecs;
+    ...
+}
+```
+
+**Execution Path to Branch:**
+```
+LLVMFuzzerTestOneInput
+  → view_sam(...)
+      → sam_hdr_read(in) on a BAM input  → hdr with hrecs==NULL
+      → sam_hdr_count_lines(hdr, "SQ")   [harness line 97]
+          → if (!bh->hrecs) sam_hdr_fill_hrecs(bh)  ← BLOCKING GUARDS HERE
+              bh->target_name: NULL (n4 BAM inputs have no valid reference list)
+              bh->text:        NULL (n4 BAM inputs have no embedded header text)
+```
+
+**Path Conditions Required:**
+- Rank 17 True: BAM input where the binary header has `n_targets >= 1` (a 4-byte LE
+  reference count field in the BAM header), causing `bam_hdr_read` to populate
+  `bh->target_name` and `bh->target_len`.
+- Rank 6 True: BAM input where the embedded SAM text section has `l_text > 0` (the
+  4-byte LE text length field in the BAM header contains a non-zero value and is followed
+  by that many bytes of SAM header text).
+- n4 never produces BAM inputs (magic `BAM\1` gate), so neither condition is ever met.
+
+**Root Cause Category:** Input Format / Structure Constraints (BAM magic + structured header)
+
+**Root Cause Explanation:**
+`sam_hdr_fill_hrecs` is called lazily when a header object was created without its
+`hrecs` structure (the BAM path). For n4's execution flow: n4 reaches
+`sam_hdr_fill_hrecs` via `sam_hdr_count_lines` (harness line 97), but only from SAM
+format inputs where `bh->hrecs` was already set by `sam_hdr_create` — meaning the
+`if (!bh->hrecs)` guard in `sam_hdr_count_lines` is False and `sam_hdr_fill_hrecs` is
+skipped entirely. When n4 does somehow reach `sam_hdr_fill_hrecs` (via a BAM-like input
+that fails early), `bh->target_name` and `bh->text` are NULL because the BAM header
+parse never completed.
+
+The cmplog fuzzer has BAM seeds with non-empty reference lists and embedded header text,
+so it fires both True arms regularly (flip strength 7,260 and 3,540).
+
+**Fuzzer Barrier Severity:** High
+
+**Recommended Mitigations:**
+1. A BAM seed with `BAM\1` magic + `n_targets >= 1` + non-empty `l_text` section
+   unblocks both ranks simultaneously.
+2. Add `BAM\1` to the dictionary; once BAM paths are entered, mutation will
+   populate the reference-count and text-length fields.
+
+---
+
+### BLOCKING BRANCH ANALYSIS
+```
+========================
+Cluster: C06 (single — ks_resize False: buffer already sufficient)
+Branches:
+  header.c (inlined ks_resize):162:6  False  (rank 2 — if (s->m < size))
+Location: ks_resize() inlined into header.c compilation unit
+Branch Condition: False means s->m >= size — existing kstring capacity is sufficient,
+                  realloc is skipped.
+Coverage Status:
+  Rank 2 (162:6 F): cmplog T:15,900  F:27,800 | n4 T:5,490  F:0
+  True arm (need to grow buffer) hit by both; False arm (buffer reuse) only cmplog.
+```
+
+**Code context (kstring.h, inlined at compile time into header.c):**
+```c
+static inline int ks_resize(kstring_t *s, size_t size) {
+    if (s->m < size) {      // False: s->m >= size, buffer already big enough
         char *tmp;
-        size = (size > (SIZE_MAX>>2)) ? size : size + (size >> 1);
-        tmp = (char*)realloc(s->s, size);
-        if (!tmp) return -1;
-        s->s = tmp;
+        kroundup_sz(size);
+        if (size > SIZE_MAX - 1 || !(tmp = (char*)realloc(s->s, size + 1)))
+            return -1;
         s->m = size;
+        s->s = tmp;
     }
     return 0;
 }
 ```
 
-The False branch (`s->m >= size`) fires when the kstring buffer is already large enough — i.e., a second or subsequent call to `ks_resize` reuses a previously allocated buffer.
-
 **Execution Path to Branch:**
-
 ```
 LLVMFuzzerTestOneInput
-  → view_sam(data, size, "w", 1)      [SAM output]
-    → hts_hopen → format detection
-    → sam_hdr_read(in)
-      → sam_hrecs_parse_line (header.c)
-        → loop over '@'-prefixed header lines
-          → kputsn(fp->line.s, fp->line.l, &str)   [header.c:1405]
-            → ks_resize(&str, str.l + fp->line.l)  [first call → True: allocates]
-          → [second header line]
-          → kputsn(fp->line.s, fp->line.l, &str)
-            → ks_resize(&str, str.l + fp->line.l)  [second call → False: reuses buffer]
+  → view_sam(...)
+      → sam_hdr_read(in) on SAM input
+          → sam_hdr_build_from_sam_file(hdr, fp)
+              → loop: hts_getline (read @-header lines)
+              → for each header line: ks_resize(&str, needed_size)
+                  1st call: s->m == 0 → s->m < size → True (alloc)
+                  2nd call: s->m >= needed_size → False ← BLOCKED IN n4
+                  (buffer reuse on second/subsequent SAM header lines)
 ```
 
 **Path Conditions Required:**
+1. SAM format input (so `sam_hdr_build_from_sam_file` is called).
+2. At least two `@`-header lines, so the second line fits within the capacity allocated
+   for the first (triggering the buffer-reuse False arm).
+3. n4 never produces SAM inputs (C02 gate).
 
-1. Input must be recognized as `sequence_data` (SAM/BAM/CRAM magic or `@` header).
-2. `sam_hdr_read` must successfully parse at least one `@`-prefixed header line so that `str` is allocated.
-3. **At least a second valid `@` header line must follow** such that the cumulative `kputsn` length on the second line does not exceed `str.m` — i.e., `str.l + line2.l <= str.m`. Because `ks_resize` grows the buffer by 1.5× on the first call, a second line of roughly equal or smaller length to the first will fit in the already-allocated buffer, hitting the False branch.
-
-**Root Cause Category:** Fuzzer Seed/Dictionary Deficiency + Deep Nested Condition Dependencies
+**Root Cause Category:** Fuzzer Seed/Dictionary Deficiency (prerequisite: SAM format gate)
 
 **Root Cause Explanation:**
+The False arm of `ks_resize` fires when a kstring's existing allocation is large enough
+to hold the new data — common during SAM header processing when multiple lines of similar
+length are read sequentially. After the first `@`-header line is processed and the buffer
+is grown to accommodate it, subsequent lines of equal or shorter length reuse the buffer
+without reallocating.
 
-The n4 fuzzer's corpus does not contain inputs with multiple valid SAM header lines. A single `@HD` or `@SQ` line causes one `ks_resize` call (True branch — buffer allocated). For the False branch to fire, a second header line must be present that fits within the already-allocated buffer capacity.
+n4 never reaches this code because it never produces SAM inputs. The C02 mitigation
+(SAM seeds) is fully sufficient to unblock this branch as well.
 
-The n4 fuzzer is further blocked upstream by the SAM format gate: the input must begin with `@` (or BAM magic), and each header line must pass `valid_sam_header_type` (`@HD`, `@SQ`, `@RG`, `@PG`, `@CO`). Without a seed containing at least two such lines, the buffer is freshly created for each run and `s->m` never exceeds the first line's allocation. Since the buffer is initialized fresh per `view_sam` call (`str` is a local `kstring_t` on the stack, initialized to `{0,0,NULL}`), every single-line run hits only the True branch.
-
-The cmplog fuzzer overcomes this via comparison logging — it identifies the `@`-type tokens and learns to produce multi-line headers, resulting in 27,800 False-branch hits.
-
-**Fuzzer Barrier Severity: High**
-
-The False branch is reachable with any two valid SAM header lines, but requires the fuzzer to consistently produce structured multi-line `@`-prefixed content. Without seeds or dictionary tokens, the n4 fuzzer explores this territory very slowly.
+**Fuzzer Barrier Severity:** High (gated behind SAM format; self-resolves with SAM seeds)
 
 **Recommended Mitigations:**
-
-1. Add a seed with two or more SAM header lines, e.g.:
-   ```
-   @HD\tVN:1.6\n@SQ\tSN:chr1\tLN:248956422\n
-   ```
-   This guarantees the False branch fires on the second `kputsn` call.
-2. Add dictionary tokens: `@HD`, `@SQ`, `@RG`, `@PG`, `@CO`, `VN:`, `SN:`, `LN:`.
-3. For thoroughness, add a seed with a longer first line followed by a shorter second line to ensure `str.l + line2.l <= str.m` on the second call.
+1. The C02 SAM seed mitigation is sufficient. A multi-line SAM header (2+ `@SQ` lines)
+   maximizes buffer-reuse opportunities.
 
 ---
 
-### BLOCKER 3
-
+### BLOCKING BRANCH ANALYSIS
 ```
-BLOCKING BRANCH ANALYSIS
 ========================
-Location: hts.c:5123 (get_severity_tag)
-Branch Condition: switch (severity) — case HTS_LOG_ERROR (value=1): False side
-                  i.e., the switch falls through to a non-ERROR case
-Blocked Side: False (n4 always enters the HTS_LOG_ERROR case; never falls through)
-Coverage Status: n4: True=279 / False=0  |  cmplog: True=7,640 / False=22,600
-Flip Strength: 22,600
+Cluster: C07 (single — pool_destroy loop True: pool has allocated entries)
+Branches:
+  cram/pooled_alloc.c:87:17  True  (rank 5 — for (i = 0; i < p->npools; i++))
+Location: pool_destroy() in cram/pooled_alloc.c (lines 84–92)
+Branch Condition: loop condition `i < p->npools`, True means pool was used (npools > 0)
+Coverage Status:
+  Rank 5 (87:17 T): cmplog T:12,400  F:30,400 | n4 T:0  F:14,600
+  False arm (empty pool, no body) hit by both; True arm (iterate and free) only cmplog.
 ```
 
-Note: The coverage tool labels these lines as `get_severity_tag`. In the source
-tree at this analysis date, the function body appears at hts.c:5165, but the
-instrumented binary was compiled from a slightly earlier version where it was at
-line 5121. The logic is identical.
-
-```c
-static char get_severity_tag(enum htsLogLevel severity)
-{
-    switch (severity) {
-    case HTS_LOG_ERROR:       // line 5123 — branch True=279, False=0 in n4
-        return 'E';
-    case HTS_LOG_WARNING:     // line 5125 — branch True=0, False=279 in n4
-        return 'W';
-    case HTS_LOG_INFO:
-        return 'I';
-    ...
-    }
-    return '*';
-}
-```
-
-The "False" side of `case HTS_LOG_ERROR` means the switch did not match
-`HTS_LOG_ERROR` — i.e., `severity` was something other than `HTS_LOG_ERROR`
-(value 1). This branch is the collective "fall-through" to subsequent cases.
-
-**Execution Path to Branch:**
-
-```
-LLVMFuzzerTestOneInput
-  → view_sam / view_vcf / format detection
-    → any hts_log_warning(...) call   [e.g., hts_log(HTS_LOG_WARNING, ...)]
-      → hts_log(severity=HTS_LOG_WARNING, ...)
-        → (severity=3 <= hts_verbose=3: condition true)
-        → get_severity_tag(HTS_LOG_WARNING)   [severity=3, not HTS_LOG_ERROR=1]
-          → switch falls through case HTS_LOG_ERROR → hits case HTS_LOG_WARNING
-```
-
-**Path Conditions Required:**
-
-1. `hts_log` must be called with `severity <= hts_verbose` (default: `HTS_LOG_WARNING = 3`).
-2. The `severity` argument must not be `HTS_LOG_ERROR` (value 1). It must be `HTS_LOG_WARNING` (value 3), `HTS_LOG_INFO` (4), `HTS_LOG_DEBUG` (5), or `HTS_LOG_TRACE` (6).
-3. Therefore, a `hts_log_warning(...)` call site must be triggered. There are approximately 149 `hts_log_warning` call sites across the htslib source. These fire for conditions like duplicate `@SQ` reference names, non-fatal header inconsistencies, or format quirks that do not cause parsing failure.
-
-**Root Cause Category:** Algorithmic/Semantic Barrier (enum gap) + Fuzzer Seed/Dictionary Deficiency
-
-**Root Cause Explanation:**
-
-`HTS_LOG_WARNING` has enum value 3 (not 2 — there is a deliberate gap in the enum):
-
-```c
-enum htsLogLevel {
-    HTS_LOG_OFF,       // 0
-    HTS_LOG_ERROR,     // 1
-    HTS_LOG_WARNING = 3,  // explicit skip of value 2
-    HTS_LOG_INFO,      // 4
-    ...
-};
-```
-
-Value 2 is deliberately unused. All 279 calls to `hts_log` that n4 triggers arrive via `hts_log_error` (severity=1). This means every parse failure, memory error, or invalid input condition produces an ERROR-level log call, hitting only the `HTS_LOG_ERROR` case in `get_severity_tag`.
-
-A WARNING-level log requires the input to be *partially valid*: the parser must successfully enter the header processing logic and then encounter a non-fatal anomaly (e.g., a duplicate `@SQ` SN, an unknown optional tag, a missing optional field). The n4 fuzzer's inputs are either too malformed (immediately rejected, producing ERROR logs) or too random (not reaching warning-emitting code paths at all).
-
-This blocker is a direct consequence of the n4 fuzzer lacking seeds that produce partially-valid SAM headers which pass initial validation but contain soft errors that trigger warnings.
-
-**Fuzzer Barrier Severity: High**
-
-The WARNING path requires inputs that are structurally valid enough to pass primary parsing gates yet contain specific secondary anomalies. This is a narrow semantic corridor that random mutation from malformed seeds almost never reaches.
-
-**Recommended Mitigations:**
-
-1. Add a seed with a duplicate `@SQ SN:` name, which triggers `hts_log_warning` from the `add_sq_seq_names` path in `header.c`. Example:
-   ```
-   @HD\tVN:1.6\n@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr1\tLN:2000\n
-   ```
-   This forces two SQ entries with the same name but different LN values, which triggers a WARNING about conflicting SQ lines.
-2. Alternatively, include a seed that triggers the `hts_log_warning` in `hts_detect_format2` for ambiguous format signatures.
-3. Consider enabling a custom log handler during fuzzing that counts WARNING calls, allowing coverage feedback to treat a WARNING invocation as a distinct coverage event.
-
----
-
-### BLOCKER 4
-
-```
-BLOCKING BRANCH ANALYSIS
-========================
-Location: hts.c:5125 (get_severity_tag)
-Branch Condition: switch (severity) — case HTS_LOG_WARNING (value=3): True side
-                  i.e., severity == HTS_LOG_WARNING
-Blocked Side: True (n4 never enters the HTS_LOG_WARNING case)
-Coverage Status: n4: True=0 / False=279  |  cmplog: True=22,600 / False=7,640
-Flip Strength: 22,600
-```
-
-This is the symmetric counterpart to Blocker 3 in the same switch statement. The
-True side of `case HTS_LOG_WARNING` fires when `severity == HTS_LOG_WARNING` (value 3).
-The False side (which n4 always hits) means the switch fell through this case without
-matching — i.e., `severity` was `HTS_LOG_ERROR` (the only value that reaches
-`get_severity_tag` in n4).
-
-**Execution Path to Branch:**
-
-Identical to Blocker 3. The same call to `get_severity_tag(HTS_LOG_WARNING)` that
-produces the False side of Blocker 3 also produces the True side of Blocker 4.
-Both blockers are resolved by the same fix.
-
-**Path Conditions Required:**
-
-Same as Blocker 3:
-1. A `hts_log_warning(...)` (or `hts_log(HTS_LOG_WARNING, ...)`) call must be triggered.
-2. The `hts_log` gate `severity <= hts_verbose` must pass (it always does for WARNING since `hts_verbose` defaults to `HTS_LOG_WARNING=3`).
-3. The input must be partially valid enough to reach a warning-emitting code path.
-
-**Root Cause Category:** Algorithmic/Semantic Barrier (same enum gap) + Fuzzer Seed/Dictionary Deficiency
-
-**Root Cause Explanation:**
-
-This is the exact complement of Blocker 3 within the same switch body. In the
-n4 campaign, all 279 `get_severity_tag` invocations carry `severity=HTS_LOG_ERROR`
-(value 1), which matches `case HTS_LOG_ERROR` immediately and returns `'E'` without
-ever evaluating `case HTS_LOG_WARNING`. The True branch of `case HTS_LOG_WARNING`
-therefore has zero hits.
-
-The root cause is identical: the n4 fuzzer cannot produce inputs that trigger
-warning-level conditions. See Blocker 3 for the full explanation.
-
-**Fuzzer Barrier Severity: High**
-
-Same severity as Blocker 3. Blockers 3 and 4 are resolved together by any input
-that causes a single `hts_log_warning` call.
-
-**Recommended Mitigations:**
-
-Identical to Blocker 3. Both blockers are unblocked simultaneously by any seed
-that triggers a WARNING-level log event.
-
----
-
-### BLOCKER 5
-
-```
-BLOCKING BRANCH ANALYSIS
-========================
-Location: cram/pooled_alloc.c:87 (pool_destroy)
-Branch Condition: for (i = 0; i < p->npools; i++)  — True side: loop body entered
-Blocked Side: True (n4 never enters the loop body)
-Coverage Status: n4: True=0 / False=14,600  |  cmplog: True=12,400 / False=30,400
-Flip Strength: 12,400
-```
-
+**Code at pool_destroy:**
 ```c
 void pool_destroy(pool_alloc_t *p) {
     size_t i;
-
-    for (i = 0; i < p->npools; i++) {    // line 87 — True blocked in n4
+    for (i = 0; i < p->npools; i++) {   // ← True arm BLOCKED in n4
         free(p->pools[i].pool);
     }
     free(p->pools);
@@ -355,145 +601,323 @@ void pool_destroy(pool_alloc_t *p) {
 }
 ```
 
-The True branch fires when `p->npools > 0`, meaning at least one memory pool block
-was allocated via `pool_alloc` → `new_pool`. The False branch (loop condition false
-on first check) fires when `p->npools == 0` — the pool was created but never had
-`pool_alloc` called on it.
-
 **Execution Path to Branch:**
-
 ```
 LLVMFuzzerTestOneInput
-  → view_sam(data, size, "w", 1)
-    → hts_hopen → format detection (sequence_data)
-    → sam_hdr_read(in)
-      → sam_hrecs_parse_line(hrecs, ...)      [header.c:1368 loop]
-        → sam_hrecs_parse_single_line(...)    [header.c:1394]
-          → pool_alloc(hrecs->type_pool)       [header.c:562]
-            → new_pool(p) → p->npools++        [pooled_alloc.c:110]
-      → sam_hrecs_free(hrecs)                  [on cleanup path]
-        → pool_destroy(hrecs->type_pool)       [header.c:2483]
-          → for (i=0; i < p->npools; i++)      ← True branch fires
+  → view_sam(...)
+      → sam_hdr_read(in) on SAM input
+          → sam_hdr_create(fp)
+              → sam_hdr_build_from_sam_file(hdr, fp)
+                  → sam_hrecs_parse_single_line(hrecs, line, len)
+                      → pool_alloc(hrecs->str_pool, ...)
+                          → new_pool(p)   [if current pool exhausted]
+                              → p->npools++   [becomes >= 1]
+      → sam_hdr_destroy(hdr)
+          → sam_hrecs_free(hrecs)
+              → pool_destroy(hrecs->str_pool)   ← BLOCKING BRANCH
+                  i < p->npools (True if npools > 0)
 ```
 
-For the True branch to fire, `pool_alloc` must be called at least once, which
-requires `sam_hrecs_parse_single_line` to succeed on at least one header line.
-
 **Path Conditions Required:**
+1. SAM format input (so `sam_hrecs_parse_single_line` is called).
+2. At least one valid `@`-prefixed header line that is successfully parsed, causing
+   `pool_alloc` to be called, which calls `new_pool` and increments `p->npools` to 1.
 
-1. Input must be recognized as `sequence_data` (SAM `@` prefix or BAM/CRAM magic).
-2. `sam_hdr_read` must enter the header parsing loop (first byte of input is `@`).
-3. At least one header line must pass all of the following in `sam_hrecs_parse_line` (header.c):
-   - Line length >= 3 characters.
-   - `fp->line.s[1]` and `fp->line.s[2]` are both `isalpha_c`.
-   - `valid_sam_header_type` returns true (`@HD`, `@SQ`, `@RG`, `@PG`, or `@CO`).
-4. `sam_hrecs_parse_single_line` must succeed without returning NULL — meaning tag parsing (colon-delimited key-value pairs) succeeds and `pool_alloc(hrecs->type_pool)` is called at line 562.
-
-**Root Cause Category:** Deep Nested Condition Dependencies + Fuzzer Seed/Dictionary Deficiency
+**Root Cause Category:** Fuzzer Seed/Dictionary Deficiency (prerequisite: SAM format gate)
 
 **Root Cause Explanation:**
+`pool_alloc` is the SAM header string pool allocator used to store string fragments from
+parsed `@`-header lines. The pool's `npools` counter starts at 0 and is incremented by
+`new_pool` whenever a new memory block is requested. `pool_alloc` is only called from
+`sam_hrecs_parse_single_line`, which is only called when a SAM header line beginning with
+`@` is encountered.
 
-`pool_destroy` is called 14,600 times in the n4 campaign, but `p->npools` is always 0.
-The coverage data (n4.cov, lines 2480-2486) shows that the `pool_destroy` calls in the
-successful header-parsing teardown path (`sam_hrecs_free`, header.c:2480-2486) run
-7,330 times — but `npools` is 0 in every case.
+n4 never produces SAM inputs → `sam_hrecs_parse_single_line` never runs → `pool_alloc`
+never called → `p->npools` remains 0 → `pool_destroy` loop condition `i < p->npools`
+is always False immediately.
 
-This happens because `pool_alloc` is only called from `sam_hrecs_parse_single_line`
-(header.c:562, 609, 814, 865, 935). For `pool_alloc` to be called, the line must:
-(a) start with `@`, (b) have two valid alpha characters as the type code, (c) match
-one of the five known SAM header types, and (d) have the line successfully tokenized
-into key=value fields. The n4 fuzzer's inputs that reach the SAM parsing path fail
-the `valid_sam_header_type` check (line 1388) because the two type characters are
-random, or the line is too short, or the format detection misidentifies the input.
+The cmplog fuzzer hits the True arm 12,400 times, confirming it regularly processes SAM
+inputs with at least one valid header line.
 
-The coverage of `sam_hrecs_parse_single_line` for n4 is 0 (the function itself has
-zero hits in n4), confirming that no header line ever passes all of the gates in
-the `sam_hdr_read` loop before `pool_alloc` is reached. Without `pool_alloc` being
-called even once, `new_pool` never increments `npools`, and `pool_destroy` always
-sees an empty pool.
-
-**Fuzzer Barrier Severity: High**
-
-The barrier is a conjunction: valid SAM `@`-type prefix, valid two-character type
-keyword, and at least one parseable key=value tag pair. Any of these three checks
-failing silently rejects the header line before `pool_alloc` is called. The n4 fuzzer
-has no dictionary or seed that reliably produces this combination.
+**Fuzzer Barrier Severity:** High (fully unblocked by C02 SAM seed mitigation)
 
 **Recommended Mitigations:**
+1. The C02 SAM seed is sufficient. Any SAM input with a single `@HD\t` or `@SQ\t` line
+   parsed successfully will increment `npools` to 1 and unblock this branch.
 
-1. Add a minimal valid SAM header seed:
+---
+
+### BLOCKING BRANCH ANALYSIS
+```
+========================
+Cluster: C08 (single — add_stub_ref_sq_lines loop True: nref > 0)
+Branches:
+  header.c:1109:19 (source ~1270:5) True  (rank 15 —
+    for (tid = 0; tid < hrecs->nref; tid++))
+Location: add_stub_ref_sq_lines() in header.c (lines 1266–1287)
+Branch Condition: loop condition True means hrecs->nref > 0
+Coverage Status:
+  Rank 15 (1109:19 T): cmplog T:4,030  F:11,100 | n4 T:0  F:7,330
+  False arm (nref == 0) heavily hit; True arm (iterate references) only cmplog.
+```
+
+**Code at add_stub_ref_sq_lines:**
+```c
+static int add_stub_ref_sq_lines(sam_hrecs_t *hrecs) {
+    int tid;
+    char len[32];
+    for (tid = 0; tid < hrecs->nref; tid++) {  // ← True BLOCKED in n4
+        if (hrecs->ref[tid].ty == NULL) {
+            // add synthetic @SQ line for a reference without an @SQ record
+            ...
+        }
+    }
+    return 0;
+}
+```
+
+**Execution Path to Branch:**
+```
+LLVMFuzzerTestOneInput
+  → view_sam(...)
+      → sam_hdr_count_lines(hdr, "SQ")
+          → sam_hdr_fill_hrecs(bh)
+              → sam_hrecs_refs_from_targets_array(hrecs, bh)
+                  → hrecs->nref = bh->n_targets   [e.g. 1]
+              → add_stub_ref_sq_lines(hrecs)  ← BLOCKING BRANCH
+                  tid < hrecs->nref (True if nref > 0)
+```
+
+**Path Conditions Required:**
+- `bh->n_targets >= 1`: requires a BAM input with a reference count field ≥ 1 in the
+  binary header, OR a SAM input with `@SQ` lines that were processed before this call.
+- n4 never produces BAM inputs and never produces SAM inputs (dual gate).
+
+**Root Cause Category:** Input Format / Structure Constraints (BAM/SAM format gate)
+
+**Root Cause Explanation:**
+`hrecs->nref` is populated from `bh->n_targets` by `sam_hrecs_refs_from_targets_array`
+(called when `bh->n_targets > 0`). For n4: `bh->n_targets` is always 0 because:
+(a) BAM inputs (which store the reference list in binary) are never produced by n4.
+(b) SAM inputs (which populate `n_targets` via `@SQ` parsing) are never produced by n4.
+Thus `hrecs->nref` stays 0 and `add_stub_ref_sq_lines` finds no work to do.
+
+**Fuzzer Barrier Severity:** High
+
+**Recommended Mitigations:**
+1. Any BAM seed with `n_targets >= 1` in the binary header unblocks this branch.
+2. Any SAM seed with at least one `@SQ\tSN:...\tLN:...\n` line also unblocks it.
+3. Both are already covered by the C02 and C04 seed recommendations.
+
+---
+
+### BLOCKING BRANCH ANALYSIS
+```
+========================
+Cluster: C09 (single — sam_hdr_count_lines error guard)
+Branches:
+  header.c:2150:9 (coverage: 1789:13) True  (rank 18 —
+    if (sam_hdr_fill_hrecs(bh) != 0))
+Location: sam_hdr_count_lines() in header.c (lines 2142–2170)
+Branch Condition: sam_hdr_fill_hrecs returns -1 (error)
+Coverage Status:
+  Rank 18 (1789:13 T): cmplog T:3,020  F:7,650 | n4 T:0  F:5,490
+  False arm (success) hit by both; True arm (error) only cmplog.
+```
+
+**Code at sam_hdr_count_lines (header.c:2142–2152):**
+```c
+int sam_hdr_count_lines(sam_hdr_t *bh, const char *type) {
+    ...
+    if (!bh->hrecs) {
+        if (sam_hdr_fill_hrecs(bh) != 0)   // ← True arm BLOCKED in n4
+            return -1;
+    }
+    ...
+}
+```
+
+**Path Conditions Required:**
+1. `bh->hrecs` must be NULL at the time of the call (BAM path — bam_hdr_read leaves
+   `bh->hrecs = NULL`).
+2. `sam_hdr_fill_hrecs` must then fail (return -1), which requires:
+   - `bh->text` is non-NULL and `l_text > 0` (so `sam_hrecs_parse_lines` is called), AND
+   - The embedded SAM text has a parsing error, e.g., a duplicate `@SQ SN:` entry:
+     `header.c:1229: hts_log_error("Duplicate entry \"%s\" ...")` returns -1.
+
+**Root Cause Category:** Deep Nested Condition Dependencies (BAM format + malformed header)
+
+**Root Cause Explanation:**
+For this error path to fire, the fuzzer must produce a BAM input that:
+(a) Passes the `BAM\1` magic check (4-byte prefix).
+(b) Has `l_text > 0` (non-empty embedded SAM header section).
+(c) Contains a duplicate `@SQ SN:` tag pair in the embedded text, causing
+    `sam_hrecs_parse_lines` to return -1 inside `sam_hdr_fill_hrecs`.
+
+The n4 fuzzer never achieves (a) — it never produces BAM inputs. When n4 does reach
+`sam_hdr_count_lines`, `bh->hrecs` is always already set (n4's inputs come from SAM path
+where hrecs is populated immediately), so the `if (!bh->hrecs)` guard is False and
+`sam_hdr_fill_hrecs` is never called from this site.
+
+**Fuzzer Barrier Severity:** High (two-layer requirement: BAM magic + malformed text)
+
+**Recommended Mitigations:**
+1. A BAM seed with a duplicate reference name in the embedded SAM text section directly
+   triggers this error path:
+   `BAM\1` + [l_text bytes] + `@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr1\tLN:2000\n`.
+2. The general BAM seed recommendation (C04/C05 mitigations) is a prerequisite; once
+   BAM inputs are explored, mutation will occasionally produce duplicate `@SQ` entries.
+
+---
+
+### BLOCKING BRANCH ANALYSIS
+```
+========================
+Cluster: C10 (single — hts_detect_format2 @CO\t magic match)
+Branches:
+  hts.c:696:15  True  (rank 19 — memcmp(s, "@CO\t", 4) == 0)
+Location: hts_detect_format2() in hts.c (lines 693–706)
+Branch Condition: last alternative in a 5-way || expression matching SAM header tags
+Coverage Status:
+  Rank 19 (696:15 T): cmplog T:3,000  F:418 | n4 T:0  F:409
+  False arm (no @CO match — but overall SAM clause matched via earlier alternative)
+  hit by n4; True arm (@CO match specifically) never hit by n4.
+```
+
+**Code context (hts.c:693–706):**
+```c
+else if (len >= 4 && s[0] == '@' &&
+         (memcmp(s, "@HD\t", 4) == 0 || memcmp(s, "@SQ\t", 4) == 0 ||
+          memcmp(s, "@RG\t", 4) == 0 || memcmp(s, "@PG\t", 4) == 0 ||
+          memcmp(s, "@CO\t", 4) == 0)) {    // ← rank 19 True BLOCKED
+    fmt->category = sequence_data;
+    fmt->format = sam;
+    ...
+}
+```
+Note: In llvm-cov branch reporting, each `||` sub-expression generates its own branch
+entry. Rank 19's True arm means the `memcmp(s, "@CO\t", 4) == 0` comparison returned
+true (the first four alternatives were all false, but the fifth matched).
+
+**Path Conditions Required:**
+1. Input bytes 0–3 must be `@CO\t` specifically (not `@HD`, `@SQ`, `@RG`, or `@PG`).
+2. The `@CO\t` token is a SAM comment header; it is rarely used in practice and absent
+   from most fuzzing seed corpora and dictionaries.
+3. n4 never produces any `@XX\t` prefix (C02 gate), making this doubly blocked.
+
+**Root Cause Category:** Fuzzer Seed/Dictionary Deficiency; Magic Value constraints
+
+**Root Cause Explanation:**
+The `@CO\t` check is the last of five alternatives in a short-circuit `||` expression.
+Reaching the True arm of this specific sub-expression requires that all four preceding
+alternatives were False AND the fifth (`@CO\t`) matched. This means the input must start
+with `@CO\t` — not just any SAM header prefix.
+
+Even the cmplog fuzzer, which has learned `@HD\t` and `@SQ\t` (the most common SAM
+headers), produces `@CO\t` only when it specifically has a seed or dictionary token
+containing that string. The n4 fuzzer has neither. The `@CO` comment tag is valid SAM
+spec but uncommon in real-world files and absent from typical fuzzer dictionaries.
+
+**Fuzzer Barrier Severity:** High
+
+**Recommended Mitigations:**
+1. Add `@CO\t` explicitly to the AFL++ dictionary.
+2. Add a SAM seed that begins with `@CO\t`, e.g.:
    ```
-   @HD\tVN:1.6\n
+   @CO\tThis is a comment line\n
    ```
-   This is the simplest input that passes all three gates and causes `pool_alloc` to
-   be called for the `@HD` type entry, incrementing `npools` to 1.
-2. For stronger coverage, add:
-   ```
-   @HD\tVN:1.6\n@SQ\tSN:chr1\tLN:1000\n
-   ```
-   This causes two `pool_alloc` calls (one type + one tag entry each), giving
-   `npools >= 1` and reliably hitting the True branch of the loop in `pool_destroy`.
-3. Add dictionary tokens: `@HD`, `@SQ`, `@RG`, `@PG`, `@CO`, `VN:`, `SN:`, `LN:`.
-4. The same seed also unblocks Blocker 2 (ks_resize False) and Blockers 3/4
-   (get_severity_tag WARNING), making a single well-chosen seed highly effective.
+3. The C02 SAM seeds mitigations should include a `@CO` line (the recommended seed
+   above already contains one).
 
 ---
 
 ## Summary Table
 
-| Rank | Location | Blocked Side | Root Cause Category | Severity | Single Fix |
-|------|----------|-------------|---------------------|----------|------------|
-| 1 | `cram_io.c:3747` (`cram_free_container`) | False | Input Format/Structure: CRAM magic bytes required for encoder path | **Critical** | Add CRAM seed file |
-| 2 | `kstring.h:162` (`ks_resize`, in header.c) | False | Seed Deficiency: requires 2+ valid SAM header lines | **High** | Add multi-line SAM seed |
-| 3 | `hts.c:5123` (`get_severity_tag`) | False | Semantic Barrier: WARNING-level log never triggered | **High** | Add seed with soft-error header |
-| 4 | `hts.c:5125` (`get_severity_tag`) | True | Semantic Barrier: same as Blocker 3, symmetric case | **High** | Same as Blocker 3 |
-| 5 | `pooled_alloc.c:87` (`pool_destroy`) | True | Nested Conditions: `pool_alloc` never called, `npools` stays 0 | **High** | Add minimal `@HD` seed |
+| Rank | Function | Line:Col | Side | Cluster | Root Cause | Severity |
+|------|----------|----------|------|---------|------------|----------|
+| 1 | `cram_free_container` | 3747:13 | False | C03 | CRAM magic bytes never in n4 corpus | Critical |
+| 11 | `cram_free_container` | 3730:9 | False | C03 | CRAM magic bytes never in n4 corpus | Critical |
+| 12 | `cram_free_container` | 3751:9 | False | C03 | CRAM magic bytes never in n4 corpus | Critical |
+| 13 | `cram_free_container` | 3723:9 | False | C03 | CRAM magic bytes never in n4 corpus | Critical |
+| 20 | `cram_free_container` | 3720:9 | False | C03 | CRAM magic bytes never in n4 corpus | Critical |
+| 2 | `header.c:ks_resize` | 162:6 | False | C06 | SAM format gate (buffer reuse) | High |
+| 3 | `get_severity_tag` | 5123:5 | False | C01 | Semi-valid SAM needed for WARNING | High |
+| 4 | `get_severity_tag` | 5125:5 | True | C01 | Semi-valid SAM needed for WARNING | High |
+| 5 | `pool_destroy` | 87:17 | True | C07 | SAM format gate (pool unused) | High |
+| 6 | `sam_hdr_fill_hrecs` | 1142:21 | True | C05 | BAM magic + non-empty header text | High |
+| 7 | `hts_hopen` | 1583:5 | True | C02 | SAM `@XX\t` magic absent in n4 | High |
+| 8 | `sam_read1` | 4394:9 | True | C02 | SAM `@XX\t` magic absent in n4 | High |
+| 9 | `sam_hdr_read` | 2207:5 | True | C02 | SAM `@XX\t` magic absent in n4 | High |
+| 10 | `sam_hdr_destroy` | 122:9 | True | C04 | SAM format gate (ref_count) | High |
+| 14 | `sam_hdr_destroy` | 134:9 | False | C04 | BAM path needed (hrecs=NULL) | High |
+| 15 | `add_stub_ref_sq_lines` | 1109:19 | True | C08 | BAM/SAM with nref > 0 | High |
+| 16 | `sam_hdr_destroy` | 127:9 | True | C04 | SAM format gate (target_name) | High |
+| 17 | `sam_hdr_fill_hrecs` | 1134:9 | True | C05 | BAM magic + n_targets > 0 | High |
+| 18 | `sam_hdr_count_lines` | 1789:13 | True | C09 | BAM + malformed embedded header | High |
+| 19 | `hts_detect_format2` | 696:15 | True | C10 | `@CO\t` magic token absent | High |
 
 ---
 
 ## Top Recommendations
 
-Listed in order of expected coverage impact (most blockers unblocked per action):
+### P1 — Add a SAM seed to the n4 corpus (unblocks ranks 2, 3, 4, 5, 7, 8, 9, 10, 16, 19)
 
-### Recommendation 1: Add a multi-line SAM header seed with a soft error
+The single most impactful action. A seed that starts with `@CO\t` (to cover rank 19)
+and includes a duplicate `@SQ` with conflicting LN (to cover ranks 3, 4):
 
 ```
-@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr1\tLN:2000\n
+@CO\tFuzzer seed comment
+@HD\tVN:1.6\tSO:unsorted
+@SQ\tSN:chr1\tLN:248956422
+@SQ\tSN:chr1\tLN:500000
+@RG\tID:rg1\tSM:sample1
+@PG\tID:prog1\tPN:tool\tVN:1.0
+read1\t0\tchr1\t100\t60\t10M\t*\t0\t0\tACGTACGTAC\tIIIIIIIIII
 ```
 
-**Unblocks:** Blockers 2, 3, 4, and 5 simultaneously.
+This 10-cluster unblock is the highest-ROI change possible for this campaign.
 
-- Blocker 5 (`pool_destroy` True): `pool_alloc` is called for the `@HD` and both
-  `@SQ` entries, so `npools >= 1`.
-- Blocker 2 (`ks_resize` False): three header lines cause multiple `kputsn` calls
-  on the same `str` buffer; the second and third calls find `str.m` already large
-  enough.
-- Blockers 3 and 4 (`get_severity_tag` WARNING): the duplicate `@SQ SN:chr1` with
-  conflicting `LN` values triggers a `hts_log_warning` from the SAM header
-  validation logic (`add_sq_seq_names` in `header.c`), sending severity 3
-  (`HTS_LOG_WARNING`) through `get_severity_tag`.
+### P2 — Add a CRAM seed to the n4 corpus (unblocks ranks 1, 11, 12, 13, 20)
 
-### Recommendation 2: Add a real CRAM seed file
+Generate with: `samtools view -C -o minimal.cram minimal.bam`
+Add `minimal.cram` to the n4 seed directory. This is the only way to exercise
+the CRAM encoder/decoder paths and unblock the five C03 cluster branches.
 
-Place any minimal valid CRAM file (one reference, one read) in the fuzzer corpus.
+### P3 — Add a BAM seed to the n4 corpus (unblocks ranks 6, 14, 15, 17, 18)
 
-**Unblocks:** Blocker 1 (`cram_free_container` False).
+A BAM file with: (a) at least one reference sequence (`n_targets >= 1`), (b) non-empty
+embedded header text (`l_text > 0`). For rank 18, also include a duplicate `@SQ SN:`
+in the embedded text to trigger the fill-hrecs error path.
 
-A CRAM seed causes `format.category == sequence_data` with CRAM format, routing
-the input through `view_sam(..., "wc", ...)`, which invokes `cram_new_container`.
-`cram_new_container` populates `stats[]` via `cram_stats_create()`, making the
-False branch of `if (c->stats[id])` reachable for the first time.
+### P4 — Extend the AFL++ dictionary
 
-### Recommendation 3: Add AFL++ fuzzer dictionary tokens
+```
+# SAM header tokens
+@HD\t
+@SQ\t
+@RG\t
+@PG\t
+@CO\t
+VN:1.6\t
+SN:chr1\t
+LN:1000\n
 
-Tokens to add: `CRAM`, `@HD`, `@SQ`, `@RG`, `@PG`, `@CO`, `VN:1.6`, `SN:`, `LN:`.
+# Format magic bytes
+CRAM
+BAM\x01
+\x1f\x8b\x08\x00
+```
 
-This allows random mutations to land on valid SAM/CRAM constructs more often,
-accelerating discovery of the conditions required for all five blockers.
+### P5 — Consider a structured / grammar-aware mutator
 
-### Recommendation 4: Long-term — structured SAM/CRAM mutator
+All 20 top blocking branches reduce to a single theme: the n4 fuzzer cannot produce
+inputs that satisfy the binary magic-byte checks guarding CRAM (`CRAM` + version bytes),
+BAM (`BAM\1`), or SAM (`@XX\t` prefix). A structured mutator that understands these
+format frames — or a harness wrapper that splices format-correct headers around the
+fuzzer's payload — would address all 20 blockers simultaneously and provide much deeper
+penetration into the SAM/BAM/CRAM processing code.
 
-For sustained coverage improvement beyond the top-5 blockers, integrate a
-format-aware mutator (e.g., using `libprotobuf-mutator` with a SAM/CRAM grammar
-or a custom AFL++ custom mutator). Structured mutation prevents the fuzzer from
-spending budget on inputs that fail format detection gates entirely.
+---
+
+*Report written to `/home/miao/BlockerAnalyzer/reports/htslib_report.md`*
+*Analysis date: 2026-03-18*

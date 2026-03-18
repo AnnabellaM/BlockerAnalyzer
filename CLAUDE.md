@@ -23,6 +23,7 @@ BlockerAnalyzer/
 │   ├── blocker_3/      # Synthetic: compile-time gate
 │   └── blocker_4/      # Synthetic: magic value conjunction
 ├── blockers/           # Output from fuzzing-branch-analyzer (<target>_blockers.md)
+├── slices/             # Output from program-slice-builder (<target>_slices.md)
 ├── reports/            # Output from fuzzing-root-cause-analyzer (<target>_report.md)
 ├── analysis/           # Output from fuzzing-coverage-analyst (<target>_analysis.md)
 ├── tools/              # Reusable analysis scripts
@@ -56,12 +57,13 @@ Reports are llvm-cov annotated source files. Branch data appears inline:
 
 ## Agents
 
-Three specialized agents are available in `.claude/agents/`:
+Four specialized agents are available in `.claude/agents/`:
 
 | Agent | Output folder | File naming | Purpose |
 |-------|--------------|-------------|---------|
 | **fuzzing-branch-analyzer** | `blockers/` | `<target>_blockers.md` | Parses coverage reports, identifies asymmetric branch pairs, cross-references across fuzzers to confirm input-dependency |
-| **fuzzing-root-cause-analyzer** | `reports/` | `<target>_report.md` | Traces execution paths to blocking branches and classifies root causes (magic value, checksum, dead code, compile-time gate, etc.) |
+| **program-slice-builder** | `slices/` | `<target>_slices.md` | Applies NEG pre-screening and traces execution paths (program slices) from the fuzzer entry point to each blocking branch; default batch size 10 |
+| **fuzzing-root-cause-analyzer** | `reports/` | `<target>_report.md` | Reads pre-built slices, clusters by slice similarity, classifies root causes, and writes findings with mitigations |
 | **fuzzing-coverage-analyst** | `analysis/` | `<target>_analysis.md` | Analyzes fuzzing campaigns (seed queues, mutation patterns) to diagnose why a fuzzer failed to penetrate input-dependent blockers |
 
 ## Permissions
@@ -89,23 +91,43 @@ python3 tools/extract_blockers.py \
 
 With `--output`, produces a fully formatted, ranked Markdown report directly — no further processing needed. Without `--output`, outputs raw JSON to stdout.
 
+Each confirmed blocker carries a `source_line` field: the raw source text at the branch's line, extracted from the coverage file. This appears as `**Statement**: \`...\`` in the Markdown listings and gives `fuzzing-root-cause-analyzer` quick context before reading full source files.
+
+### Program Slices
+
+`program-slice-builder` constructs a **program slice** for each confirmed blocker: an ordered sequence of control and data flow nodes from the fuzzer entry point to the blocking branch. Each node carries the exact statement text, file:line, types, and function signatures — enough for an LLM to reconstruct a compilable C skeleton.
+
+Node types: `ENTRY` (fuzzer entry), `CALL` (function call on path), `CTRL` (control flow condition, annotated with required direction), `DATA` (variable binding that feeds the blocking condition), `BRANCH` (the blocking branch, always last).
+
+Slices are written to `slices/<target>_slices.md` and consumed by `fuzzing-root-cause-analyzer`. The file is appended to across batches, so multiple runs accumulate into a single target file.
+
 ### Branch Clustering
 
-`extract_blockers.py` automatically clusters confirmed blockers using source line text extracted from the coverage file. Each branch receives a `cluster_id` and `cluster_type` in the output:
+Clustering is performed by `fuzzing-root-cause-analyzer` from pre-built slices, using **program slice similarity**.
 
-| Type | Detection rule | Meaning |
-|------|---------------|---------|
-| `logical` | Source line contains `&&` or `\|\|` | Sub-conditions of one logical expression (multiple branches per line) |
-| `switch` | Source line starts with `case`/`default:`; backward brace-depth scan confirms enclosing `switch` | Arms of the same switch statement |
-| `chain` | Source line contains `else if (`; backward brace-depth scan finds opening `if` | Arms of the same if/else-if chain |
-| `ternary` | Source line contains `?` but no `if`/`case`/`else` keyword | Conditional expression (`x ? a : b`) |
-| `single` | No recognizable pattern | Standalone condition |
+Two blockers are clustered when their slices share structural ancestry:
 
-Each branch in the output also carries a `source_line` field with the raw source text at that line. This appears as `**Statement**: \`...\`` in the detail listings.
+| Relationship | Criterion | Cluster role |
+|--------------|-----------|-------------|
+| **Downstream** | Slice A ⊇ Slice B (A has all of B's nodes plus more) | B is the cluster root; A is a downstream member |
+| **Peer** | Slices share the same root node but neither contains the other | Both are peers; the shared root variable/condition is the cluster focus |
 
-The backward scan tracks brace depth to find the correct enclosing construct, handling one level of nesting. Deeper nesting may occasionally produce mis-grouped clusters; `fuzzing-root-cause-analyzer` confirms and refines all clusters in Step 1.5 using source code.
+The cluster representative is always the blocker with the simplest (most upstream) slice. Resolving the root blocker's barrier also unblocks all downstream members. Peer members share the same fix strategy.
 
-The Cluster column in the Markdown summary table shows e.g. `C003 (switch×2)`. Detail listings include cross-references: `also at rank 4`.
+Cluster IDs (C01, C02, …) are assigned by the root cause analyzer in Step 2 and carried through the report.
+
+### Negative Rules (Pre-screening)
+
+`program-slice-builder` screens each blocker against four negative rules before building its slice. A blocker that matches is **skipped** and recorded in the Skipped Blockers section of the slices file, then carried through to the Skipped Blockers section of the root cause report.
+
+| Rule | Criterion |
+|------|-----------|
+| **NEG-1** | Blocked block body contains only a `return` statement |
+| **NEG-2** | Blocked block body contains only an error handler (`opt_error`, `fprintf`+`exit`, `abort`, `assert`, etc.) |
+| **NEG-3** | Blocked block body contains only cleanup (`free`, `close`, `destroy`, etc.) |
+| **NEG-4** | Branch or context is annotated `deprecated`, `legacy`, or `obsolete` |
+
+Rules are defined inline in `program-slice-builder.md` — `rules.md` is superseded.
 
 ### Blocker Ranking
 
@@ -119,5 +141,6 @@ Because the blocked side has 0 hits in the primary fuzzer, flip strength equals 
 
 1. Run fuzzers (e.g., AFL++ cmplog and n4 variants) on a target, collect llvm-cov reports into `coverage/<target>/`.
 2. Use `fuzzing-branch-analyzer` to identify input-dependent blocking branches → output in `blockers/`.
-3. Use `fuzzing-root-cause-analyzer` on confirmed blocking branches to produce structured root-cause reports → output in `reports/`.
-4. Use `fuzzing-coverage-analyst` on input-dependent blockers with fuzzing campaign data to diagnose fuzzer logic weaknesses → output in `analysis/`.
+3. Use `program-slice-builder` on the blockers file to apply NEG screening and trace execution paths → output in `slices/`. Default batch size is 10; specify rank ranges for large targets.
+4. Use `fuzzing-root-cause-analyzer` on the slices file to cluster, classify root causes, and write findings → output in `reports/`.
+5. Use `fuzzing-coverage-analyst` on input-dependent blockers with fuzzing campaign data to diagnose fuzzer logic weaknesses → output in `analysis/`.
