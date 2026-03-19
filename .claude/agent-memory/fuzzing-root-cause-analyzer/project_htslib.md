@@ -31,6 +31,15 @@ branches — format detection is the first gate every input must pass.
 - `cram_read_container` uses `calloc` — so `c->stats[]` is all NULL.
   Only `cram_new_container` (encoder path) populates `stats[]` via
   `cram_stats_create()`. The decoder path always produces stats-null containers.
+- The False branch of `if (c->stats[id])` at `cram_io.c:3747` fires for decoder
+  containers (NULL stats from calloc) and never for encoder containers (all non-NULL).
+  The encoder partial-failure path does NOT reach line 3747: `cram_new_container`'s
+  `err:` block (line 3693) frees `c` directly, never calling `cram_free_container`.
+  Therefore, to exercise the False side, the fuzzer needs a CRAM-format input that
+  exercises `cram_read_container` — not just any CRAM encoder activity.
+- `SEQS_PER_SLICE = 10000` (cram_structs.h:87), `SLICE_PER_CNT = 1` (cram_structs.h:89).
+  Container flush via `cram_next_container` requires 10,000 records per slice by default.
+  Harness-level override: `cram_set_option(fd, CRAM_OPT_SEQS_PER_SLICE, 2)` reduces to 2.
 - `sam_hdr_fill_hrecs` is the lazy-parse entrypoint for BAM headers. Its two
   guards (bh->target_name and bh->text) only fire for BAM inputs with non-empty
   reference lists and embedded SAM text respectively.

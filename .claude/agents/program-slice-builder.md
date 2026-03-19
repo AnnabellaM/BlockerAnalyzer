@@ -98,7 +98,11 @@ True side (0) is deprecated → SKIP (NEG-4)
 
 For every blocker that passed NEG screening, construct a program slice. Process blockers in rank order (highest flip strength first).
 
-**How to build a slice:**
+**How to build a dynamic slice:**
+
+Slices are **dynamic** — only nodes actually executed by at least one fuzzer are included. This requires cross-referencing every candidate node against both fuzzer coverage files.
+
+Coverage files are at `coverage/<target>/cmplog.cov` and `coverage/<target>/n4.cov` (identify fuzzer names by globbing `coverage/<target>/*.cov`). Format: `<line_num>|<count>|<source_text>`. Use grep/awk to extract the count for a specific line number without reading entire files.
 
 1. Locate the blocking branch in source using `func`/`demangled_func` and `line:col`. Use `source_line` as an immediate starting point.
 2. Identify the **blocking condition**: the variable or expression being tested at the branch.
@@ -107,6 +111,10 @@ For every blocker that passed NEG screening, construct a program slice. Process 
    - **Control dependencies**: find every conditional that must hold for execution to reach this statement
 4. Continue tracing backward up the call stack until you reach the fuzzer entry point (`LLVMFuzzerTestOneInput` or equivalent harness function).
 5. Reorder the collected nodes as a **forward sequence from entry to blocker**.
+6. **Dynamic filter**: for each candidate node, look up its line count in both coverage files. **Keep** the node only if at least one fuzzer shows a non-zero count. **Drop** nodes with 0 hits in both fuzzers — they are not on the actual runtime path.
+7. **Gap detection**: if dropping 0-hit nodes creates a gap in the path (A → C but the connecting node B was dropped), search for an alternate caller of C with non-zero hits and re-trace through that caller instead. A gap is a signal the original static trace picked the wrong path.
+8. **Annotate** every kept node with `[cmplog: N | n4: N]` counts.
+9. **Divergence point**: identify the earliest node where one fuzzer's count drops to 0 while the other remains non-zero. Record as one line (node type, file:line, counts) — no explanation.
 
 **Node types:**
 
@@ -141,6 +149,7 @@ Write (or append to) `slices/<target>_slices.md` using the format below.
 **Generated:** <date>
 **Source:** `blockers/<target>_blockers.md`
 **Ranks processed:** N–M  (P passed NEG screening, Q skipped)
+**Mode:** Dynamic slice (nodes filtered to non-zero hit count in at least one fuzzer)
 
 ---
 
@@ -165,23 +174,29 @@ Write (or append to) `slices/<target>_slices.md` using the format below.
 ### Program Slice
 
 ```
-ENTRY  <file>:<line>          <full C function signature>
-CALL   <file>:<line>          <return_type> <func>(<param_types>)
-CTRL   <file>:<line>          <condition expression>                        [must=True|False]
-DATA   <file>:<line>          <type> <var> = <expression>                   [feeds=<downstream_var>]
-CALL   <file>:<line>          <return_type> <func>(<param_types>)
-BRANCH <file>:<line>:<col>    <condition expression>                        [blocked=True|False]
+ENTRY  <file>:<line>          <full C function signature>                              [cmplog: N | n4: N]
+CALL   <file>:<line>          <return_type> <func>(<param_types>)                      [cmplog: N | n4: N]
+CTRL   <file>:<line>          <condition expression>         [must=True|False]          [cmplog: N | n4: N]
+DATA   <file>:<line>          <type> <var> = <expression>    [feeds=<downstream_var>]   [cmplog: N | n4: N]
+CALL   <file>:<line>          <return_type> <func>(<param_types>)                      [cmplog: N | n4: N]
+BRANCH <file>:<line>:<col>    <condition expression>         [blocked=True|False]       [cmplog: N | n4: N]
 ```
+
+**Divergence point:** `<node type> <func or condition> at <file>:<line>` — [cmplog: N | n4: N]
+
+*(One line only — no explanation of why the counts differ. That is the root-cause-analyzer's job.)*
 
 ### Key Variables
 
-| Variable | Type | Role |
-|----------|------|------|
-| `<var>` | `<full C type>` | what it represents and how it gates the blocking branch |
+| Variable | Type |
+|----------|------|
+| `<var>` | `<full C type>` |
+
+*(Types and names only — no role descriptions or interpretations.)*
 
 ### Path Conditions
 
-1. <first condition that must hold to reach the blocking branch>
+1. <structural condition that must hold to reach the blocking branch — state the fact, not why it is hard to satisfy>
 2. <second condition>
 ...
 
@@ -199,6 +214,9 @@ BRANCH <file>:<line>:<col>    <condition expression>                        [blo
 - **Annotate every DATA node** with `[feeds=<var>]` pointing to the downstream variable it affects
 - **If source is unavailable** for a call on the trace, note `[source unavailable]` and describe the call's expected behavior from context
 - **Do not cluster or classify** — that is the root-cause-analyzer's job; your output is purely structural
+- **Do not analyze or interpret** — do not explain why hitcounts differ, why a condition is hard to satisfy, or what the divergence point means. Record facts only: node type, file:line, counts. All reasoning belongs in the root-cause-analyzer.
+- **Key Variables: types only** — omit role descriptions and interpretations from the Key Variables table; include only variable name and full C type
+- **Path Conditions: structural facts only** — state what must be true (e.g., "`hdr != NULL`"), not why it matters or how likely it is
 
 **Update your agent memory** as you discover recurring patterns: common fuzzer entry point structures per target, frequently appearing CTRL/DATA nodes that gate large code regions, template instantiation patterns in C++ targets, and source layout conventions that affect tracing.
 

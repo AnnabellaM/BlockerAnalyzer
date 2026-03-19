@@ -57,6 +57,24 @@ For each cluster, identify the root cause category:
 - **Fuzzer Seed / Dictionary Deficiency** — theoretically reachable but requires tokens absent from the corpus
 - **Other** — e.g., the function that initializes a guarding variable is never called
 
+### Step 3b: Targeted Hitcount Lookup (on demand)
+
+Slices are purely structural — they carry no per-node execution counts. When the root cause classification is ambiguous or the code structure alone cannot explain *where* along the path the fuzzers diverge, perform targeted hitcount lookups from the coverage files at `coverage/<target>/<fuzzer>.cov`.
+
+**When to trigger a lookup:**
+- The blocking condition looks reachable from both fuzzers based on code structure, but flip strength says otherwise — the barrier may be upstream
+- The slice contains a CALL node that could route execution differently depending on input format (e.g., format detection, dispatch tables, parser entry points)
+- The root cause would be classified differently depending on whether the fuzzer reaches the enclosing function at all vs. reaches it but fails the predicate
+
+**How to perform a lookup:**
+Coverage files use llvm-cov annotated source format: `<line_num>|<count>|<source_text>`. Use grep/awk to extract the count for a specific line number within the correct file section — do not read entire coverage files. Identify the fuzzer names from `coverage/<target>/` by globbing `*.cov`.
+
+**Minimum useful spot check:** look up the CALL node immediately preceding the BRANCH, and (if divergence is still unclear) the first CALL node after ENTRY. Two data points are usually sufficient to determine whether the barrier is upstream of the predicate or at the predicate itself.
+
+**Structural anomaly signal:** if a CALL node's count is 0 in both fuzzers yet the BRANCH inside that function shows high counts, the slice has traced the wrong call path — the function is being reached via a different code path not captured in the slice. Note this explicitly in the finding and describe the likely alternate path.
+
+Record any hitcounts obtained in the `Coverage Status` and `Divergence Point` fields of the finding block.
+
 ### Step 4: Write Findings
 
 For each cluster, produce one structured finding block. Order findings by severity (Critical first).
@@ -73,7 +91,8 @@ Role: <cluster-root | peer | downstream>
 Branches: <list of "file:line:col (blocked side)" for all members>
 Location: <enclosing function> in <source file>
 Branch Condition: <the shared conditional expression, switch variable, or root data dependency>
-Coverage Status: <hit counts per fuzzer for each branch member>
+Coverage Status: <hit counts per fuzzer at the blocking branch; include any additional node counts looked up during Step 3b>
+Divergence Point: <populated only when a Step 3b lookup was performed — node type, file:line, and counts that reveal where fuzzers split; omit if not looked up>
 
 Program Slice (entry → blocking branch):
   [ENTRY]  <full C function signature>                                 (<file>:<line>)

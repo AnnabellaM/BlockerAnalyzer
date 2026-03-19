@@ -95,9 +95,13 @@ Each confirmed blocker carries a `source_line` field: the raw source text at the
 
 ### Program Slices
 
-`program-slice-builder` constructs a **program slice** for each confirmed blocker: an ordered sequence of control and data flow nodes from the fuzzer entry point to the blocking branch. Each node carries the exact statement text, file:line, types, and function signatures — enough for an LLM to reconstruct a compilable C skeleton.
+`program-slice-builder` constructs a **dynamic program slice** for each confirmed blocker: an ordered sequence of control and data flow nodes from the fuzzer entry point to the blocking branch, filtered to only nodes actually executed by at least one fuzzer. Each node carries the exact statement text, file:line, types, function signatures, and per-fuzzer execution counts `[cmplog: N | n4: N]`.
 
 Node types: `ENTRY` (fuzzer entry), `CALL` (function call on path), `CTRL` (control flow condition, annotated with required direction), `DATA` (variable binding that feeds the blocking condition), `BRANCH` (the blocking branch, always last).
+
+**Dynamic filtering:** nodes with 0 hits in all fuzzers are dropped — they are not on the actual runtime path. If dropping a node creates a gap in the path, the agent searches for an alternate caller with non-zero hits, catching wrong-path traces early.
+
+Each slice includes a one-line **Divergence point**: the earliest node where one fuzzer's count drops to 0 while the other remains non-zero. The slice carries no analysis or interpretation — all reasoning is deferred to `fuzzing-root-cause-analyzer`.
 
 Slices are written to `slices/<target>_slices.md` and consumed by `fuzzing-root-cause-analyzer`. The file is appended to across batches, so multiple runs accumulate into a single target file.
 
